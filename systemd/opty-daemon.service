@@ -1,6 +1,6 @@
 [Unit]
 Description=opty — HDC-powered codebase context optimizer daemon
-Documentation=https://github.com/youruser/opty
+Documentation=https://github.com/boj/opty
 After=default.target
 
 [Service]
@@ -10,12 +10,6 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-
-# Watchdog: restart if unresponsive for 60s
-WatchdogSec=60
-
-# Environment
-Environment=HOME=%h
 
 [Install]
 WantedBy=default.target

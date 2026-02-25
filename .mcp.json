@@ -2,8 +2,7 @@
   "mcpServers": {
     "opty": {
       "command": "/home/bojo/.local/bin/opty",
-      "args": ["mcp-client"],
-      "tools": ["*"]
+      "args": ["mcp-client"]
     }
   }
 }
