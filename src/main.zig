@@ -5,7 +5,7 @@ const encoder = @import("encoder.zig");
 const brain_mod = @import("brain.zig");
 const toon = @import("toon.zig");
 const parser = @import("parser.zig");
-const posix = std.posix;
+
 
 const DEFAULT_PORT: u16 = 7390;
 const VERSION = "0.1.0";
@@ -89,18 +89,11 @@ fn printUsage() void {
 fn sendCommand(_: std.mem.Allocator, port: u16, payload: []const u8, prefix: []const u8) !void {
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
 
-    const sock = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch {
+    const stream = std.net.tcpConnectToAddress(addr) catch {
         std.debug.print("error: cannot connect to daemon on port {d}. Is it running?\n", .{port});
         return;
     };
-    defer posix.close(sock);
-
-    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {
-        std.debug.print("error: cannot connect to daemon on port {d}. Is it running?\n", .{port});
-        return;
-    };
-
-    const stream = std.net.Stream{ .handle = sock };
+    defer stream.close();
 
     // Send command
     var msg_buf: [8200]u8 = undefined;
@@ -134,7 +127,7 @@ fn oneshotQuery(alloc: std.mem.Allocator, root: []const u8, query_text: []const 
         const lang = parser.Language.fromExtension(entry.path);
         if (!lang.isSupported()) continue;
 
-        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, entry.path });
+        const full_path = try std.fs.path.join(alloc, &.{ root, entry.path });
         defer alloc.free(full_path);
 
         const source = dir.readFileAlloc(alloc, entry.path, 10 * 1024 * 1024) catch continue;

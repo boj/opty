@@ -389,7 +389,7 @@ fn scanAndIndex(
         const lang = parser.Language.fromExtension(entry.path);
         if (!lang.isSupported()) continue;
 
-        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, entry.path });
+        const full_path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
         defer alloc.free(full_path);
 
         const stat = dir.statFile(entry.path) catch continue;

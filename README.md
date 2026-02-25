@@ -30,6 +30,8 @@ zig build
 ./zig-out/bin/opty stop
 ```
 
+On Windows, use `.\zig-out\bin\opty.exe` instead of `./zig-out/bin/opty`.
+
 ## Commands
 
 | Command | Description |
@@ -287,6 +289,8 @@ zig build                    # Debug build
 zig build -Doptimize=fast    # Release build
 zig build test               # Run tests (11 tests)
 ```
+
+Builds and runs on Linux, macOS, and Windows.
 
 ## Running as a systemd User Service
 

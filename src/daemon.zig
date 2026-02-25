@@ -5,7 +5,6 @@ const parser = @import("parser.zig");
 const toon = @import("toon.zig");
 const Brain = brain_mod.Brain;
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
 
 const DEFAULT_PORT: u16 = 7390;
 const WATCH_INTERVAL_NS: u64 = 500 * std.time.ns_per_ms;
@@ -173,7 +172,7 @@ fn scanAndIndex(state: *DaemonState) !void {
         const lang = parser.Language.fromExtension(entry.path);
         if (!lang.isSupported()) continue;
 
-        const full_path = try std.fmt.allocPrint(state.allocator, "{s}/{s}", .{ state.root_dir, entry.path });
+        const full_path = try std.fs.path.join(state.allocator, &.{ state.root_dir, entry.path });
         defer state.allocator.free(full_path);
 
         const stat = dir.statFile(entry.path) catch continue;
