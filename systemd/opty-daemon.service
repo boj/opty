@@ -1,0 +1,21 @@
+[Unit]
+Description=opty — HDC-powered codebase context optimizer daemon
+Documentation=https://github.com/youruser/opty
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/opty daemon %h/Development --port 7390
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Watchdog: restart if unresponsive for 60s
+WatchdogSec=60
+
+# Environment
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=opty — HDC-powered codebase context optimizer (daemon for %i)
+Documentation=https://github.com/youruser/opty
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/opty daemon %i --port 7390
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target
