@@ -367,7 +367,135 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-// --- File scanning (shared logic with daemon) ---
+// ==========================================================================
+// MCP Client Mode — thin bridge to global daemon via TCP
+// ==========================================================================
+
+/// Run MCP server over stdio that forwards tool calls to the global daemon.
+pub fn runClient(alloc: Allocator, project_dir: []const u8, port: u16) !void {
+    const stderr = std.fs.File.stderr();
+    var msg_buf: [256]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&msg_buf, "opty MCP client (project: {s}, daemon port: {d})\n", .{ project_dir, port });
+    try stderr.writeAll(msg);
+
+    while (true) {
+        const body = readMessage(alloc) catch break;
+        defer alloc.free(body);
+        const response = handleClientMessage(alloc, body, project_dir, port) catch continue;
+        if (response) |resp| {
+            defer alloc.free(resp);
+            writeMessage(resp) catch break;
+        }
+    }
+}
+
+fn handleClientMessage(alloc: Allocator, body: []const u8, project_dir: []const u8, port: u16) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
+        return try rpcError(alloc, null, -32700, "Parse error");
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return try rpcError(alloc, null, -32600, "Invalid request");
+
+    const id = root.object.get("id");
+    const method = jStr(root, "method") orelse
+        return try rpcError(alloc, id, -32600, "Missing method");
+
+    if (eql(method, "initialize")) {
+        return try rpcResult(alloc, id,
+            "{\"protocolVersion\":\"" ++ PROTOCOL_VERSION ++ "\"," ++
+                "\"capabilities\":{\"tools\":{}}," ++
+                "\"serverInfo\":{\"name\":\"opty\",\"version\":\"" ++ VERSION ++ "\"}}");
+    } else if (eql(method, "notifications/initialized") or eql(method, "initialized")) {
+        return null;
+    } else if (eql(method, "notifications/cancelled")) {
+        return null;
+    } else if (eql(method, "ping")) {
+        return try rpcResult(alloc, id, "{}");
+    } else if (eql(method, "tools/list")) {
+        return try handleToolsList(alloc, id);
+    } else if (eql(method, "tools/call")) {
+        return try handleClientToolsCall(alloc, id, root, project_dir, port);
+    } else if (eql(method, "resources/list")) {
+        return try rpcResult(alloc, id, "{\"resources\":[]}");
+    } else if (eql(method, "prompts/list")) {
+        return try rpcResult(alloc, id, "{\"prompts\":[]}");
+    } else {
+        return try rpcError(alloc, id, -32601, "Method not found");
+    }
+}
+
+fn handleClientToolsCall(alloc: Allocator, id: ?std.json.Value, root: std.json.Value, project_dir: []const u8, port: u16) ![]u8 {
+    const params = jObj(root, "params") orelse
+        return try rpcError(alloc, id, -32602, "Missing params");
+    const name = jStr(params, "name") orelse
+        return try rpcError(alloc, id, -32602, "Missing tool name");
+    const args = jObj(params, "arguments");
+
+    if (eql(name, "opty_query")) {
+        return try clientToolQuery(alloc, id, args, project_dir, port);
+    } else if (eql(name, "opty_status")) {
+        return try clientToolForward(alloc, id, project_dir, port, "STATUS");
+    } else if (eql(name, "opty_reindex")) {
+        return try clientToolForward(alloc, id, project_dir, port, "REINDEX");
+    } else {
+        return try callError(alloc, id, "Unknown tool");
+    }
+}
+
+fn clientToolQuery(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, project_dir: []const u8, port: u16) ![]u8 {
+    const query_text: []const u8 = blk: {
+        if (args) |a| {
+            if (jStr(a, "query")) |q| break :blk q;
+        }
+        break :blk "";
+    };
+    if (query_text.len == 0) return try callError(alloc, id, "Missing required argument: query");
+
+    const cmd = try std.fmt.allocPrint(alloc, "QUERY {s}\t{s}\n", .{ project_dir, query_text });
+    defer alloc.free(cmd);
+
+    const response = forwardToGlobal(alloc, port, cmd) catch {
+        return try callError(alloc, id, "Cannot connect to opty global daemon. Is it running?");
+    };
+    defer alloc.free(response);
+
+    if (response.len == 0) return try callText(alloc, id, "No response from daemon");
+    return try callText(alloc, id, response);
+}
+
+fn clientToolForward(alloc: Allocator, id: ?std.json.Value, project_dir: []const u8, port: u16, command: []const u8) ![]u8 {
+    const cmd = try std.fmt.allocPrint(alloc, "{s} {s}\n", .{ command, project_dir });
+    defer alloc.free(cmd);
+
+    const response = forwardToGlobal(alloc, port, cmd) catch {
+        return try callError(alloc, id, "Cannot connect to opty global daemon. Is it running?");
+    };
+    defer alloc.free(response);
+
+    if (response.len == 0) return try callText(alloc, id, "No response from daemon");
+    return try callText(alloc, id, response);
+}
+
+fn forwardToGlobal(alloc: Allocator, port: u16, command: []const u8) ![]u8 {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    const stream = try std.net.tcpConnectToAddress(addr);
+    defer stream.close();
+
+    try stream.writeAll(command);
+
+    var buf: std.ArrayList(u8) = .empty;
+    var read_buf: [65536]u8 = undefined;
+    while (true) {
+        const n = stream.read(&read_buf) catch break;
+        if (n == 0) break;
+        try buf.appendSlice(alloc, read_buf[0..n]);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+// --- File scanning (used by standalone MCP mode) ---
 
 fn scanAndIndex(
     alloc: Allocator,
@@ -389,7 +517,7 @@ fn scanAndIndex(
         const lang = parser.Language.fromExtension(entry.path);
         if (!lang.isSupported()) continue;
 
-        const full_path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
+        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, entry.path });
         defer alloc.free(full_path);
 
         const stat = dir.statFile(entry.path) catch continue;

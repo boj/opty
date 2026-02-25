@@ -5,6 +5,7 @@ pub const brain = @import("brain.zig");
 pub const toon = @import("toon.zig");
 pub const daemon = @import("daemon.zig");
 pub const mcp = @import("mcp.zig");
+pub const global = @import("global.zig");
 
 test {
     _ = hdc;

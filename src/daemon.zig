@@ -92,11 +92,16 @@ fn handleClient(state: *DaemonState, stream: std.net.Stream) !void {
     const request = std.mem.trim(u8, buf[0..n], " \t\r\n");
 
     if (std.mem.startsWith(u8, request, "QUERY ")) {
-        const query_text = request[6..];
+        const payload = request[6..];
+        // Strip CWD prefix if tab-separated (sent by global-aware clients)
+        const query_text = if (std.mem.indexOfScalar(u8, payload, '\t')) |tab_pos|
+            payload[tab_pos + 1 ..]
+        else
+            payload;
         try handleQuery(state, stream, query_text);
-    } else if (std.mem.eql(u8, request, "STATUS")) {
+    } else if (std.mem.startsWith(u8, request, "STATUS")) {
         try handleStatus(state, stream);
-    } else if (std.mem.eql(u8, request, "REINDEX")) {
+    } else if (std.mem.startsWith(u8, request, "REINDEX")) {
         state.brain.mutex.lock();
         defer state.brain.mutex.unlock();
         try scanAndIndex(state);
@@ -106,7 +111,7 @@ fn handleClient(state: *DaemonState, stream: std.net.Stream) !void {
             state.brain.fileCount(),
         });
         try stream.writeAll(resp);
-    } else if (std.mem.eql(u8, request, "SHUTDOWN")) {
+    } else if (std.mem.startsWith(u8, request, "SHUTDOWN")) {
         state.running = false;
         try stream.writeAll("OK shutting down\n");
     } else {

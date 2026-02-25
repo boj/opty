@@ -5,7 +5,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/opty daemon %h/Development --port 7390
+ExecStart=%h/.local/bin/opty global --port 7390
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

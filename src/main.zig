@@ -1,11 +1,12 @@
 const std = @import("std");
 const daemon = @import("daemon.zig");
+const global = @import("global.zig");
 const mcp = @import("mcp.zig");
 const encoder = @import("encoder.zig");
 const brain_mod = @import("brain.zig");
 const toon = @import("toon.zig");
 const parser = @import("parser.zig");
-
+const posix = std.posix;
 
 const DEFAULT_PORT: u16 = 7390;
 const VERSION = "0.1.0";
@@ -29,6 +30,8 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "daemon") or std.mem.eql(u8, cmd, "start")) {
         const root = if (args.len > 2 and !std.mem.startsWith(u8, args[2], "-")) args[2] else ".";
         try daemon.run(alloc, root, port);
+    } else if (std.mem.eql(u8, cmd, "global")) {
+        try global.run(alloc, port);
     } else if (std.mem.eql(u8, cmd, "query")) {
         if (args.len < 3) {
             std.debug.print("usage: opty query <text>\n", .{});
@@ -46,6 +49,9 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         const root = if (args.len > 2 and !std.mem.startsWith(u8, args[2], "-")) args[2] else ".";
         try mcp.run(alloc, root);
+    } else if (std.mem.eql(u8, cmd, "mcp-client")) {
+        const root = if (args.len > 2 and !std.mem.startsWith(u8, args[2], "-")) args[2] else getCwd();
+        try mcp.runClient(alloc, root, port);
     } else if (std.mem.eql(u8, cmd, "oneshot")) {
         if (args.len < 3) {
             std.debug.print("usage: opty oneshot <query> [--dir <path>]\n", .{});
@@ -70,12 +76,14 @@ fn printUsage() void {
         \\opty - HDC-powered codebase context optimizer for LLMs
         \\
         \\USAGE:
-        \\  opty daemon [dir] [--port N]    Start the daemon (foreground)
-        \\  opty mcp [dir]                   MCP server (stdio, for AI agents)
+        \\  opty daemon [dir] [--port N]    Start single-project daemon
+        \\  opty global        [--port N]   Start global multi-project daemon
         \\  opty query <text>  [--port N]   Query the running daemon
         \\  opty status        [--port N]   Show daemon status
         \\  opty reindex       [--port N]   Force re-index
         \\  opty stop          [--port N]   Stop the daemon
+        \\  opty mcp [dir]                  MCP server (stdio, standalone)
+        \\  opty mcp-client [dir] [--port N] MCP server backed by global daemon
         \\  opty oneshot <query> [--dir D]  One-shot query (no daemon)
         \\  opty version                    Show version
         \\
@@ -86,7 +94,7 @@ fn printUsage() void {
     std.debug.print("{s}", .{usage});
 }
 
-fn sendCommand(_: std.mem.Allocator, port: u16, payload: []const u8, prefix: []const u8) !void {
+fn sendCommand(alloc: std.mem.Allocator, port: u16, payload: []const u8, prefix: []const u8) !void {
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
 
     const stream = std.net.tcpConnectToAddress(addr) catch {
@@ -95,9 +103,15 @@ fn sendCommand(_: std.mem.Allocator, port: u16, payload: []const u8, prefix: []c
     };
     defer stream.close();
 
-    // Send command
-    var msg_buf: [8200]u8 = undefined;
-    const msg = try std.fmt.bufPrint(&msg_buf, "{s}{s}\n", .{ prefix, payload });
+    // Build command with CWD for global daemon routing
+    const cwd = getCwd();
+    const msg = if (std.mem.eql(u8, prefix, "QUERY "))
+        try std.fmt.allocPrint(alloc, "QUERY {s}\t{s}\n", .{ cwd, payload })
+    else if (std.mem.eql(u8, prefix, "SHUTDOWN"))
+        try std.fmt.allocPrint(alloc, "SHUTDOWN\n", .{})
+    else
+        try std.fmt.allocPrint(alloc, "{s} {s}\n", .{ prefix, cwd });
+    defer alloc.free(msg);
     try stream.writeAll(msg);
 
     // Read response
@@ -190,4 +204,10 @@ fn parseDir(args: []const []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+var global_cwd_buf: [4096]u8 = undefined;
+
+fn getCwd() []const u8 {
+    return std.posix.getcwd(&global_cwd_buf) catch ".";
 }

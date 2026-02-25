@@ -32,15 +32,49 @@ zig build
 
 On Windows, use `.\zig-out\bin\opty.exe` instead of `./zig-out/bin/opty`.
 
+## Global Multi-Project Daemon (Recommended)
+
+The **global** mode runs a single opty daemon that serves all your projects.
+Projects are auto-loaded on first query and stay indexed in memory.
+
+```bash
+# Start the global daemon (or use systemd — see below)
+opty global --port 7390 &
+
+# Query from any project directory — opty auto-detects the project root
+cd ~/projects/myapp
+opty query "authentication flow"      # auto-loads myapp
+
+cd ~/projects/api-server
+opty query "database connection pool"  # auto-loads api-server separately
+
+# Check all loaded projects
+opty status
+
+# Reindex current project
+opty reindex
+```
+
+**Project root detection** walks up from your CWD looking for these markers:
+`.git`, `build.zig`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`,
+`Makefile`, `CMakeLists.txt`, `.sln`, `Gemfile`, `pom.xml`, `build.gradle`.
+If no marker is found, the CWD itself is used as the project root.
+
+**Auto-loading** means you never need to configure project paths. Just `cd` into
+any project and query — opty indexes it on the fly (typically <500ms) and keeps
+the index in memory. The file watcher updates all loaded projects every 2 seconds.
+
 ## Commands
 
 | Command | Description |
 |---|---|
-| `opty daemon [dir] [--port N]` | Start the daemon (foreground, default port 7390) |
-| `opty mcp [dir]` | MCP server over stdio (for AI coding agents) |
-| `opty query <text> [--port N]` | Query the running daemon |
-| `opty status [--port N]` | Show indexed file/unit counts |
-| `opty reindex [--port N]` | Force full re-index |
+| `opty global [--port N]` | **Global multi-project daemon** — auto-loads projects on demand |
+| `opty daemon [dir] [--port N]` | Single-project daemon (foreground, default port 7390) |
+| `opty mcp [dir]` | Standalone MCP server over stdio (indexes locally) |
+| `opty mcp-client [--port N]` | MCP-to-daemon bridge (forwards to global daemon via TCP) |
+| `opty query <text> [--port N]` | Query the running daemon (sends CWD for project routing) |
+| `opty status [--port N]` | Show indexed file/unit counts for current project |
+| `opty reindex [--port N]` | Force full re-index of current project |
 | `opty stop [--port N]` | Shut down the daemon |
 | `opty oneshot <query> [--dir D]` | Index + query in one shot (no daemon) |
 | `opty version` | Show version |
@@ -88,7 +122,24 @@ instead of reading every file.
 
 ### Adding MCP to Your Project
 
-Drop a `.mcp.json` in your project root:
+Drop a `.mcp.json` in your project root. With the **global daemon** running, use `mcp-client`
+(lightweight bridge that forwards to the daemon via TCP):
+
+```json
+{
+  "mcpServers": {
+    "opty": {
+      "command": "/path/to/opty",
+      "args": ["mcp-client"]
+    }
+  }
+}
+```
+
+The `mcp-client` mode auto-detects the project from its working directory (set by
+the MCP host). No path configuration needed — just ensure the global daemon is running.
+
+For **standalone** mode (no daemon required — indexes locally in-process):
 
 ```json
 {
@@ -96,23 +147,6 @@ Drop a `.mcp.json` in your project root:
     "opty": {
       "command": "/path/to/opty",
       "args": ["mcp", "."]
-    }
-  }
-}
-```
-
-This is picked up automatically by Copilot CLI, Claude Code, Cursor, and other
-MCP-aware agents when they open the project. The path `.` means opty indexes
-the project directory it's launched from.
-
-For absolute paths (useful when opty is installed globally):
-
-```json
-{
-  "mcpServers": {
-    "opty": {
-      "command": "opty",
-      "args": ["mcp", "/home/you/projects/myapp"]
     }
   }
 }
@@ -127,7 +161,7 @@ Add to `~/.claude/claude_desktop_config.json` (Desktop) or `~/.claude.json` (Cod
   "mcpServers": {
     "opty": {
       "command": "/path/to/opty",
-      "args": ["mcp", "/path/to/your/project"]
+      "args": ["mcp-client"]
     }
   }
 }
@@ -142,7 +176,7 @@ Add to `.vscode/mcp.json` in your workspace:
   "servers": {
     "opty": {
       "command": "/path/to/opty",
-      "args": ["mcp", "."]
+      "args": ["mcp-client"]
     }
   }
 }
@@ -328,7 +362,7 @@ On Windows, use Task Scheduler instead of systemd to run opty on login:
 # Create a scheduled task that starts opty daemon on login
 $action = New-ScheduledTaskAction `
     -Execute "$env:USERPROFILE\.local\bin\opty.exe" `
-    -Argument "daemon $env:USERPROFILE\Development --port 7390"
+    -Argument "global --port 7390"
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName "opty-daemon" -Action $action -Trigger $trigger -Settings $settings
@@ -349,7 +383,7 @@ The `.mcp.json` config uses the same format — just adjust paths:
   "mcpServers": {
     "opty": {
       "command": "C:\\Users\\you\\.local\\bin\\opty.exe",
-      "args": ["mcp", "C:\\Users\\you\\projects\\myapp"]
+      "args": ["mcp-client"]
     }
   }
 }
@@ -360,18 +394,23 @@ The `.mcp.json` config uses the same format — just adjust paths:
 opty ships with systemd user service files for always-on indexing that survives
 reboots and runs in the background.
 
-### Quick Install
+### Quick Install (Global Daemon — Recommended)
 
 ```bash
 # Build first, then install binary + services
 zig build
 ./systemd/install.sh
 
-# Start watching your default dev directory
+# Start the global daemon (auto-loads projects on demand)
 systemctl --user enable --now opty-daemon
 ```
 
+The default service runs `opty global --port 7390`. All projects are auto-loaded
+when first queried — no per-project configuration needed.
+
 ### Watch a Specific Project (Template Instance)
+
+If you prefer per-project daemons instead of the global daemon:
 
 The `opty-daemon@.service` template lets you run separate instances per directory:
 
@@ -392,7 +431,7 @@ systemctl --user edit opty-daemon
 ```ini
 [Service]
 ExecStart=
-ExecStart=%h/.local/bin/opty daemon /path/to/your/project --port 7390
+ExecStart=%h/.local/bin/opty global --port 7390
 ```
 
 ### Useful Commands
