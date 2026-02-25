@@ -282,7 +282,9 @@ components — "auth handling functions" will match because it shares the
 
 ## Building
 
-Requires Zig 0.15+.
+Requires [Zig 0.15+](https://ziglang.org/download/).
+
+### Linux / macOS
 
 ```bash
 zig build                    # Debug build
@@ -290,9 +292,70 @@ zig build -Doptimize=fast    # Release build
 zig build test               # Run tests (11 tests)
 ```
 
-Builds and runs on Linux, macOS, and Windows.
+### Windows
 
-## Running as a systemd User Service
+opty builds natively on Windows with the standard Zig toolchain:
+
+```powershell
+zig build                    # Debug build
+zig build -Doptimize=fast    # Release build
+zig build test               # Run tests
+```
+
+The binary is output to `zig-out\bin\opty.exe`. All commands work the same:
+
+```powershell
+.\zig-out\bin\opty.exe oneshot "error handling" --dir C:\Users\you\projects\myapp
+.\zig-out\bin\opty.exe daemon C:\Users\you\projects\myapp
+.\zig-out\bin\opty.exe query "database functions"
+.\zig-out\bin\opty.exe mcp C:\Users\you\projects\myapp
+```
+
+### Windows via WSL
+
+If building on a Windows filesystem from WSL, use a tmpdir-based cache to avoid
+filesystem permission issues:
+
+```bash
+zig build --cache-dir /tmp/opty-zig-cache --global-cache-dir /tmp/opty-zig-global
+```
+
+### Windows Service (Task Scheduler)
+
+On Windows, use Task Scheduler instead of systemd to run opty on login:
+
+```powershell
+# Create a scheduled task that starts opty daemon on login
+$action = New-ScheduledTaskAction `
+    -Execute "$env:USERPROFILE\.local\bin\opty.exe" `
+    -Argument "daemon $env:USERPROFILE\Development --port 7390"
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "opty-daemon" -Action $action -Trigger $trigger -Settings $settings
+
+# Check status
+Get-ScheduledTask -TaskName "opty-daemon"
+
+# Remove
+Unregister-ScheduledTask -TaskName "opty-daemon" -Confirm:$false
+```
+
+### MCP on Windows
+
+The `.mcp.json` config uses the same format — just adjust paths:
+
+```json
+{
+  "mcpServers": {
+    "opty": {
+      "command": "C:\\Users\\you\\.local\\bin\\opty.exe",
+      "args": ["mcp", "C:\\Users\\you\\projects\\myapp"]
+    }
+  }
+}
+```
+
+## Running as a systemd User Service (Linux)
 
 opty ships with systemd user service files for always-on indexing that survives
 reboots and runs in the background.
