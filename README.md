@@ -2,6 +2,27 @@
 
 A semantic code search tool built with [Hyperdimensional Computing](https://en.wikipedia.org/wiki/Hyperdimensional_computing) (HDC). It indexes function signatures, type definitions, and imports from your codebase and lets you find them by concept rather than by name.
 
+## When to use opty vs grep
+
+opty and grep solve different problems. Use the right tool for the job:
+
+| Scenario | opty | grep |
+|---|---|---|
+| "How does indexing work?" | ✅ Returns `scanAndIndex`, `IgnoreFilter`, `watchLoop` | ❌ What would you grep for? |
+| Find all uses of `alloc.free` | ❌ Too syntactic | ✅ `grep "alloc.free"` |
+| "What types exist?" | ✅ `opty_ast` gives every type with nesting | ⚠️ `grep "pub const.*struct"` is brittle |
+| Find where port 7390 is set | ❌ HDC doesn't index literals | ✅ `grep "7390"` |
+| "What's the HTTP API surface?" | ✅ Returns route handlers semantically | ⚠️ `grep "router\."` works but misses context |
+| Rename a variable | ❌ Wrong tool entirely | ✅ grep to find, edit to replace |
+
+**Rule of thumb:** opty for *understanding*, grep for *locating*, view for *reading*, edit for *changing*.
+
+- **opty** answers conceptual questions — "what handles authentication?", "show me the error handling patterns", "what's the project structure?" — where you don't know the exact symbol names. It returns results across multiple files from a single natural language query.
+- **grep** finds exact text — specific strings, regex patterns, symbol references, configuration values. It's the right tool when you know *what* you're looking for.
+- **opty_ast** gives the full structural skeleton of a project or file (all functions, types, imports, fields, variables with nesting depth) in one call — useful for orientation before diving into code.
+
+In practice, opty queries use **88-93% fewer tokens** than reading equivalent source files, making it especially useful when feeding context to an LLM.
+
 ## What it does
 
 opty extracts **code unit skeletons** — function signatures, type/struct definitions, and import declarations — from source files. It encodes each one into a 10,000-bit binary hypervector, then matches natural language queries against them via Hamming distance.
