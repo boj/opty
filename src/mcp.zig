@@ -203,7 +203,10 @@ fn handleToolsList(alloc: Allocator, id: ?std.json.Value) ![]u8 {
             "Extracts functions, types, imports, fields, variables and enum variants with nesting depth and line numbers. " ++
             "Omit 'file' to get the entire project AST.\"," ++
             "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
-            "\"file\":{\"type\":\"string\",\"description\":\"Relative file path (e.g. 'src/main.zig'). Omit for full project AST.\"}," ++
+            "\"file\":{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"array\",\"items\":{\"type\":\"string\"}}]," ++
+            "\"description\":\"Relative file path (e.g. 'src/main.zig'). Omit for full project AST. " ++
+            "Pass an array for multiple files (e.g. ['src/main.zig', 'src/brain.zig']).\"}," ++
+            "\"pattern\":{\"type\":\"string\",\"description\":\"Glob pattern to filter files (e.g. 'src/*.zig', 'src/**/*.ts'). Can be combined with 'file'.\"}," ++
             "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}}}" ++
             "]}");
 }
@@ -314,16 +317,40 @@ fn toolReindex(
 }
 
 fn toolAst(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, root_dir: []const u8) ![]u8 {
-    const file_path: ?[]const u8 = blk: {
+    // Collect file list from "file" (string or array) parameter
+    var file_list: std.ArrayList([]const u8) = .empty;
+    defer file_list.deinit(alloc);
+
+    if (args) |a| {
+        if (a.object.get("file")) |file_val| {
+            switch (file_val) {
+                .string => |s| try file_list.append(alloc, s),
+                .array => |arr| {
+                    for (arr.items) |item| {
+                        if (item == .string) try file_list.append(alloc, item.string);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Get optional glob pattern
+    const pattern: ?[]const u8 = blk: {
         if (args) |a| {
-            if (jStr(a, "file")) |f| break :blk f;
+            if (jStr(a, "pattern")) |p| break :blk p;
         }
         break :blk null;
     };
 
-    if (file_path) |fp| {
-        return try astSingleFile(alloc, id, fp, root_dir);
+    if (file_list.items.len == 1 and pattern == null) {
+        // Single file — original fast path
+        return try astSingleFile(alloc, id, file_list.items[0], root_dir);
+    } else if (file_list.items.len > 0 or pattern != null) {
+        // Multiple files and/or glob pattern
+        return try astFiltered(alloc, id, file_list.items, pattern, root_dir);
     } else {
+        // No file or pattern — full project
         return try astProject(alloc, id, root_dir);
     }
 }
@@ -353,6 +380,68 @@ fn astSingleFile(alloc: Allocator, id: ?std.json.Value, file_path: []const u8, r
 
     var buf: std.ArrayList(u8) = .empty;
     try toon.formatFileAst(alloc, &buf, nodes, file_path, lang);
+    const output = try buf.toOwnedSlice(alloc);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
+
+fn astFiltered(alloc: Allocator, id: ?std.json.Value, explicit_files: []const []const u8, pattern: ?[]const u8, root_dir: []const u8) ![]u8 {
+    var dir = std.fs.cwd().openDir(root_dir, .{ .iterate = true }) catch {
+        return try callError(alloc, id, "Cannot open project directory");
+    };
+    defer dir.close();
+
+    var filter = ignore.IgnoreFilter.init(alloc, root_dir);
+    defer filter.deinit();
+
+    // Build a set of explicitly requested files for O(1) lookup
+    var explicit_set = std.StringHashMap(void).init(alloc);
+    defer explicit_set.deinit();
+    for (explicit_files) |f| {
+        try explicit_set.put(f, {});
+    }
+
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    var file_buf: std.ArrayList(u8) = .empty;
+    defer file_buf.deinit(alloc);
+    var total_nodes: usize = 0;
+    var file_count: usize = 0;
+
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (filter.shouldIgnore(entry.path)) continue;
+        const lang = parser.Language.fromExtension(entry.path);
+        if (!lang.isSupported()) continue;
+
+        // Check if this file matches explicit list or glob pattern
+        const in_explicit = explicit_set.contains(entry.path);
+        const matches_pattern = if (pattern) |p| ignore.globMatchPublic(p, entry.path) else false;
+        if (!in_explicit and !matches_pattern) continue;
+
+        const source = dir.readFileAlloc(alloc, entry.path, 10 * 1024 * 1024) catch continue;
+        defer alloc.free(source);
+
+        const nodes = parser.parseAst(alloc, source, lang) catch continue;
+        defer {
+            for (nodes) |n| {
+                alloc.free(n.name);
+                alloc.free(n.signature);
+            }
+            alloc.free(nodes);
+        }
+
+        try toon.formatFileAst(alloc, &file_buf, nodes, entry.path, lang);
+        total_nodes += nodes.len;
+        file_count += 1;
+    }
+
+    if (file_count == 0) return try callText(alloc, id, "No matching source files found.");
+
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(alloc, "ast{{root:\"{s}\",files:{d},nodes:{d}}}\n", .{ root_dir, file_count, total_nodes });
+    try buf.appendSlice(alloc, file_buf.items);
     const output = try buf.toOwnedSlice(alloc);
     defer alloc.free(output);
     return try callText(alloc, id, output);

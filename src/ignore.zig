@@ -139,52 +139,57 @@ pub const IgnoreFilter = struct {
     }
 
     fn globMatch(pattern: []const u8, text: []const u8) bool {
-        var pi: usize = 0;
-        var ti: usize = 0;
-        var star_pi: ?usize = null;
-        var star_ti: usize = 0;
-
-        while (ti < text.len) {
-            if (pi < pattern.len) {
-                // Handle **
-                if (pi + 1 < pattern.len and pattern[pi] == '*' and pattern[pi + 1] == '*') {
-                    pi += 2;
-                    if (pi < pattern.len and pattern[pi] == '/') pi += 1;
-                    star_pi = pi;
-                    star_ti = ti;
-                    continue;
-                }
-                // Handle *
-                if (pattern[pi] == '*') {
-                    star_pi = pi + 1;
-                    star_ti = ti;
-                    pi += 1;
-                    continue;
-                }
-                // Handle ? or exact match
-                if (pattern[pi] == '?' or pattern[pi] == text[ti]) {
-                    pi += 1;
-                    ti += 1;
-                    continue;
-                }
-            }
-
-            // Backtrack to last star
-            if (star_pi) |sp| {
-                pi = sp;
-                star_ti += 1;
-                ti = star_ti;
-                continue;
-            }
-
-            return false;
-        }
-
-        // Skip trailing stars in pattern
-        while (pi < pattern.len and pattern[pi] == '*') pi += 1;
-        return pi == pattern.len;
+        return globMatchPublic(pattern, text);
     }
 };
+
+/// Glob matching exposed for use outside IgnoreFilter (e.g. file filtering).
+pub fn globMatchPublic(pattern: []const u8, text: []const u8) bool {
+    var pi: usize = 0;
+    var ti: usize = 0;
+    var star_pi: ?usize = null;
+    var star_ti: usize = 0;
+
+    while (ti < text.len) {
+        if (pi < pattern.len) {
+            // Handle **
+            if (pi + 1 < pattern.len and pattern[pi] == '*' and pattern[pi + 1] == '*') {
+                pi += 2;
+                if (pi < pattern.len and pattern[pi] == '/') pi += 1;
+                star_pi = pi;
+                star_ti = ti;
+                continue;
+            }
+            // Handle *
+            if (pattern[pi] == '*') {
+                star_pi = pi + 1;
+                star_ti = ti;
+                pi += 1;
+                continue;
+            }
+            // Handle ? or exact match
+            if (pattern[pi] == '?' or pattern[pi] == text[ti]) {
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+        }
+
+        // Backtrack to last star
+        if (star_pi) |sp| {
+            pi = sp;
+            star_ti += 1;
+            ti = star_ti;
+            continue;
+        }
+
+        return false;
+    }
+
+    // Skip trailing stars in pattern
+    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
+    return pi == pattern.len;
+}
 
 test "builtin ignores" {
     const alloc = std.testing.allocator;
@@ -200,8 +205,11 @@ test "builtin ignores" {
 }
 
 test "glob matching" {
-    try std.testing.expect(IgnoreFilter.globMatch("*.o", "foo.o"));
-    try std.testing.expect(!IgnoreFilter.globMatch("*.o", "foo.c"));
-    try std.testing.expect(IgnoreFilter.globMatch("build", "build"));
-    try std.testing.expect(!IgnoreFilter.globMatch("build", "rebuild"));
+    try std.testing.expect(globMatchPublic("*.o", "foo.o"));
+    try std.testing.expect(!globMatchPublic("*.o", "foo.c"));
+    try std.testing.expect(globMatchPublic("build", "build"));
+    try std.testing.expect(!globMatchPublic("build", "rebuild"));
+    try std.testing.expect(globMatchPublic("src/*.zig", "src/main.zig"));
+    try std.testing.expect(!globMatchPublic("src/*.zig", "test/main.zig"));
+    try std.testing.expect(globMatchPublic("src/**/*.zig", "src/sub/deep/file.zig"));
 }
