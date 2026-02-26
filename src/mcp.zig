@@ -197,6 +197,13 @@ fn handleToolsList(alloc: Allocator, id: ?std.json.Value) ![]u8 {
             "{\"name\":\"opty_reindex\"," ++
             "\"description\":\"Force full re-scan and re-index of the codebase. Use after major file changes or stale results.\"," ++
             "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
+            "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}}}," ++
+            "{\"name\":\"opty_ast\"," ++
+            "\"description\":\"Return the full depth-aware AST of the project or a single file. " ++
+            "Extracts functions, types, imports, fields, variables and enum variants with nesting depth and line numbers. " ++
+            "Omit 'file' to get the entire project AST.\"," ++
+            "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
+            "\"file\":{\"type\":\"string\",\"description\":\"Relative file path (e.g. 'src/main.zig'). Omit for full project AST.\"}," ++
             "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}}}" ++
             "]}");
 }
@@ -221,6 +228,8 @@ fn handleToolsCall(
         return try toolStatus(alloc, id, brain, root_dir);
     } else if (eql(name, "opty_reindex")) {
         return try toolReindex(alloc, id, brain, file_mtimes, root_dir);
+    } else if (eql(name, "opty_ast")) {
+        return try toolAst(alloc, id, args, root_dir);
     } else {
         return try callError(alloc, id, "Unknown tool");
     }
@@ -304,7 +313,100 @@ fn toolReindex(
     return try callText(alloc, id, text);
 }
 
-// --- JSON-RPC response builders ---
+fn toolAst(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, root_dir: []const u8) ![]u8 {
+    const file_path: ?[]const u8 = blk: {
+        if (args) |a| {
+            if (jStr(a, "file")) |f| break :blk f;
+        }
+        break :blk null;
+    };
+
+    if (file_path) |fp| {
+        return try astSingleFile(alloc, id, fp, root_dir);
+    } else {
+        return try astProject(alloc, id, root_dir);
+    }
+}
+
+fn astSingleFile(alloc: Allocator, id: ?std.json.Value, file_path: []const u8, root_dir: []const u8) ![]u8 {
+    const lang = parser.Language.fromExtension(file_path);
+    if (!lang.isSupported()) return try callError(alloc, id, "Unsupported file type");
+
+    const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, file_path });
+    defer alloc.free(full_path);
+
+    const source = std.fs.cwd().readFileAlloc(alloc, full_path, 10 * 1024 * 1024) catch {
+        return try callError(alloc, id, "Cannot read file");
+    };
+    defer alloc.free(source);
+
+    const nodes = try parser.parseAst(alloc, source, lang);
+    defer {
+        for (nodes) |n| {
+            alloc.free(n.name);
+            alloc.free(n.signature);
+        }
+        alloc.free(nodes);
+    }
+
+    if (nodes.len == 0) return try callText(alloc, id, "No code units found in file.");
+
+    var buf: std.ArrayList(u8) = .empty;
+    try toon.formatFileAst(alloc, &buf, nodes, file_path, lang);
+    const output = try buf.toOwnedSlice(alloc);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
+
+fn astProject(alloc: Allocator, id: ?std.json.Value, root_dir: []const u8) ![]u8 {
+    var dir = std.fs.cwd().openDir(root_dir, .{ .iterate = true }) catch {
+        return try callError(alloc, id, "Cannot open project directory");
+    };
+    defer dir.close();
+
+    var filter = ignore.IgnoreFilter.init(alloc, root_dir);
+    defer filter.deinit();
+
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    var file_buf: std.ArrayList(u8) = .empty;
+    defer file_buf.deinit(alloc);
+    var total_nodes: usize = 0;
+    var file_count: usize = 0;
+
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (filter.shouldIgnore(entry.path)) continue;
+        const lang = parser.Language.fromExtension(entry.path);
+        if (!lang.isSupported()) continue;
+
+        const source = dir.readFileAlloc(alloc, entry.path, 10 * 1024 * 1024) catch continue;
+        defer alloc.free(source);
+
+        const nodes = parser.parseAst(alloc, source, lang) catch continue;
+        defer {
+            for (nodes) |n| {
+                alloc.free(n.name);
+                alloc.free(n.signature);
+            }
+            alloc.free(nodes);
+        }
+
+        try toon.formatFileAst(alloc, &file_buf, nodes, entry.path, lang);
+        total_nodes += nodes.len;
+        file_count += 1;
+    }
+
+    if (file_count == 0) return try callText(alloc, id, "No supported source files found.");
+
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(alloc, "ast{{root:\"{s}\",files:{d},nodes:{d}}}\n", .{ root_dir, file_count, total_nodes });
+    try buf.appendSlice(alloc, file_buf.items);
+    const output = try buf.toOwnedSlice(alloc);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
 
 fn rpcResult(alloc: Allocator, id: ?std.json.Value, result: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;

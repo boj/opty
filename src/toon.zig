@@ -1,5 +1,6 @@
 const std = @import("std");
 const brain_mod = @import("brain.zig");
+const parser = @import("parser.zig");
 const QueryResult = brain_mod.QueryResult;
 const Allocator = std.mem.Allocator;
 
@@ -87,6 +88,17 @@ fn formatFull(alloc: Allocator, buf: *std.ArrayList(u8), results: []const QueryR
             r.entry.unit.file_path,
             r.entry.unit.line_number,
             r.similarity,
+        });
+    }
+}
+
+/// Append a single file's AST nodes to buf in TOON format.
+/// Each row: depth,kind,name,signature,line_number
+pub fn formatFileAst(alloc: Allocator, buf: *std.ArrayList(u8), nodes: []const parser.AstNode, file_path: []const u8, lang: parser.Language) !void {
+    try buf.print(alloc, "file{{path:\"{s}\",lang:\"{s}\",nodes:{d}}}:\n", .{ file_path, lang.name(), nodes.len });
+    for (nodes) |node| {
+        try buf.print(alloc, "{d},{s},{s},{s},{d}\n", .{
+            node.depth, node.kind.label(), node.name, node.signature, node.line_number,
         });
     }
 }
