@@ -3,6 +3,7 @@ const brain_mod = @import("brain.zig");
 const encoder = @import("encoder.zig");
 const parser = @import("parser.zig");
 const toon = @import("toon.zig");
+const ignore = @import("ignore.zig");
 const Brain = brain_mod.Brain;
 const Allocator = std.mem.Allocator;
 
@@ -332,11 +333,15 @@ fn scanAndIndex(alloc: Allocator, brain: *Brain, file_mtimes: *std.StringHashMap
     };
     defer dir.close();
 
+    var filter = ignore.IgnoreFilter.init(alloc, root_dir);
+    defer filter.deinit();
+
     var walker = try dir.walk(alloc);
     defer walker.deinit();
 
     while (try walker.next()) |entry| {
         if (entry.kind != .file) continue;
+        if (filter.shouldIgnore(entry.path)) continue;
         const lang = parser.Language.fromExtension(entry.path);
         if (!lang.isSupported()) continue;
 

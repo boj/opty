@@ -6,6 +6,7 @@ const encoder = @import("encoder.zig");
 const brain_mod = @import("brain.zig");
 const toon = @import("toon.zig");
 const parser = @import("parser.zig");
+const ignore = @import("ignore.zig");
 const posix = std.posix;
 
 const DEFAULT_PORT: u16 = 7390;
@@ -132,12 +133,16 @@ fn oneshotQuery(alloc: std.mem.Allocator, root: []const u8, query_text: []const 
     var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
     defer dir.close();
 
+    var filter = ignore.IgnoreFilter.init(alloc, root);
+    defer filter.deinit();
+
     var walk = try dir.walk(alloc);
     defer walk.deinit();
 
     var file_count: usize = 0;
     while (try walk.next()) |entry| {
         if (entry.kind != .file) continue;
+        if (filter.shouldIgnore(entry.path)) continue;
         const lang = parser.Language.fromExtension(entry.path);
         if (!lang.isSupported()) continue;
 
