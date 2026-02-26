@@ -48,11 +48,21 @@ fn readMessage(alloc: Allocator) ![]u8 {
     const stdin = std.fs.File.stdin();
     var header_buf: [4096]u8 = undefined;
     var pos: usize = 0;
+    var initial_retries: usize = 0;
 
     while (pos < header_buf.len) {
         var byte: [1]u8 = undefined;
         const n = try stdin.read(&byte);
-        if (n == 0) return error.EndOfStream;
+        if (n == 0) {
+            // On some platforms (WSL), stdin pipe may not be ready yet.
+            // Retry a few times with a short sleep before giving up.
+            if (pos == 0 and initial_retries < 50) {
+                initial_retries += 1;
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                continue;
+            }
+            return error.EndOfStream;
+        }
         header_buf[pos] = byte[0];
         pos += 1;
         if (pos >= 4 and
