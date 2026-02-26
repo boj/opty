@@ -1,14 +1,15 @@
 const std = @import("std");
+const httpz = @import("httpz");
 const brain_mod = @import("brain.zig");
 const encoder = @import("encoder.zig");
 const parser = @import("parser.zig");
 const toon = @import("toon.zig");
 const ignore = @import("ignore.zig");
+const mcp = @import("mcp.zig");
 const Brain = brain_mod.Brain;
 const Allocator = std.mem.Allocator;
 
 const WATCH_INTERVAL_NS: u64 = 2 * std.time.ns_per_s;
-const MAX_REQUEST_SIZE: usize = 8192;
 
 const PROJECT_MARKERS = [_][]const u8{
     ".git",
@@ -49,12 +50,15 @@ pub const ProjectState = struct {
     }
 };
 
+const HttpServer = httpz.Server(*GlobalState);
+
 pub const GlobalState = struct {
     projects: std.StringHashMap(*ProjectState),
     allocator: Allocator,
     running: bool = true,
     port: u16,
     mutex: std.Thread.Mutex = .{},
+    http_server: ?*anyopaque = null,
 
     pub fn init(allocator: Allocator, port: u16) GlobalState {
         return .{
@@ -111,175 +115,249 @@ pub fn run(allocator: Allocator, port: u16) !void {
 
     const stderr = std.fs.File.stderr();
     var msg_buf: [256]u8 = undefined;
-    const msg = try std.fmt.bufPrint(&msg_buf, "opty global daemon on 127.0.0.1:{d} (auto-loading projects)\n", .{port});
+    const msg = try std.fmt.bufPrint(&msg_buf, "opty global daemon on http://127.0.0.1:{d} (auto-loading projects)\n", .{port});
     try stderr.writeAll(msg);
 
     const watch_thread = try std.Thread.spawn(.{}, watchLoop, .{&state});
     defer watch_thread.join();
 
-    try serveLoop(&state);
-}
-
-fn serveLoop(state: *GlobalState) !void {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, state.port);
-    var server = try addr.listen(.{ .reuse_address = true });
+    var server = try HttpServer.init(allocator, .{
+        .address = .{ .addr = .initIp4(.{ 127, 0, 0, 1 }, port) },
+        .thread_pool = .{ .count = 4 },
+        .request = .{ .max_body_size = 65536 },
+    }, &state);
     defer server.deinit();
+    state.http_server = @ptrCast(&server);
 
-    while (state.running) {
-        const conn = server.accept() catch |err| {
-            if (err == error.WouldBlock) {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
-                continue;
-            }
-            return err;
-        };
-        defer conn.stream.close();
-        handleClient(state, conn.stream) catch |err| {
-            std.log.err("client error: {}", .{err});
-        };
-    }
+    var router = try server.router(.{});
+    router.post("/query", handleQueryRoute, .{});
+    router.get("/status", handleStatusRoute, .{});
+    router.post("/reindex", handleReindexRoute, .{});
+    router.post("/shutdown", handleShutdownRoute, .{});
+    router.post("/mcp", handleMcpRoute, .{});
+
+    try server.listen();
 }
 
-fn handleClient(state: *GlobalState, stream: std.net.Stream) !void {
-    var buf: [MAX_REQUEST_SIZE]u8 = undefined;
-    const n = stream.read(&buf) catch return;
-    if (n == 0) return;
-    const request = std.mem.trim(u8, buf[0..n], " \t\r\n");
+// --- HTTP Route Handlers ---
 
-    if (std.mem.startsWith(u8, request, "QUERY ")) {
-        const payload = request[6..];
-        if (std.mem.indexOfScalar(u8, payload, '\t')) |tab_pos| {
-            const cwd = payload[0..tab_pos];
-            const query_text = payload[tab_pos + 1 ..];
-            try handleQuery(state, stream, cwd, query_text);
-        } else {
-            try stream.writeAll("ERR: QUERY requires CWD\\ttext format\n");
-        }
-    } else if (std.mem.startsWith(u8, request, "STATUS")) {
-        if (request.len > 7) {
-            const cwd = std.mem.trim(u8, request[6..], " ");
-            try handleProjectStatus(state, stream, cwd);
-        } else {
-            try handleGlobalStatus(state, stream);
-        }
-    } else if (std.mem.startsWith(u8, request, "REINDEX")) {
-        if (request.len > 8) {
-            const cwd = std.mem.trim(u8, request[7..], " ");
-            try handleReindex(state, stream, cwd);
-        } else {
-            try handleReindexAll(state, stream);
-        }
-    } else if (std.mem.eql(u8, request, "SHUTDOWN")) {
-        state.running = false;
-        try stream.writeAll("OK shutting down\n");
-    } else {
-        try stream.writeAll("ERR unknown command\n");
-    }
-}
+fn handleQueryRoute(state: *GlobalState, req: *httpz.Request, res: *httpz.Response) !void {
+    const json_body = req.body() orelse {
+        res.status = 400;
+        res.body = "Missing request body";
+        return;
+    };
 
-fn handleQuery(state: *GlobalState, stream: std.net.Stream, cwd: []const u8, query_text: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, state.allocator, json_body, .{}) catch {
+        res.status = 400;
+        res.body = "Invalid JSON";
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const cwd = jStr(root, "cwd") orelse {
+        res.status = 400;
+        res.body = "Missing 'cwd' field";
+        return;
+    };
+    const query_text = jStr(root, "query") orelse {
+        res.status = 400;
+        res.body = "Missing 'query' field";
+        return;
+    };
+
     state.mutex.lock();
     defer state.mutex.unlock();
 
-    const project = try state.getOrCreateProject(cwd);
+    const project = state.getOrCreateProject(cwd) catch {
+        res.status = 500;
+        res.body = "ERR: cannot load project";
+        return;
+    };
     const query_vec = try encoder.encodeQuery(state.allocator, query_text);
     const results = try project.brain.query(state.allocator, query_vec, 20);
     defer state.allocator.free(results);
 
     if (results.len == 0) {
-        try stream.writeAll("# no matching code units found\n");
+        res.body = "# no matching code units found\n";
         return;
     }
 
     const output = try toon.formatResults(state.allocator, results, .signatures);
     defer state.allocator.free(output);
-    try stream.writeAll(output);
+    res.body = try std.fmt.allocPrint(res.arena, "{s}", .{output});
 }
 
-fn handleGlobalStatus(state: *GlobalState, stream: std.net.Stream) !void {
+fn handleStatusRoute(state: *GlobalState, req: *httpz.Request, res: *httpz.Response) !void {
+    // Check for ?cwd= query parameter
+    const qs = try req.query();
+    const cwd = qs.get("cwd");
+
     state.mutex.lock();
     defer state.mutex.unlock();
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(state.allocator);
+    if (cwd) |c| {
+        // Project-specific status
+        const root = detectProjectRoot(state.allocator, c) catch {
+            res.status = 500;
+            res.body = "ERR: cannot detect project root";
+            return;
+        };
+        defer state.allocator.free(root);
 
-    try buf.print(state.allocator, "opty global: {d} projects loaded\n", .{state.projects.count()});
-    var it = state.projects.iterator();
-    while (it.next()) |entry| {
-        const p = entry.value_ptr.*;
-        try buf.print(state.allocator, "  {s}: {d} units, {d} files\n", .{
-            p.root_dir, p.brain.unitCount(), p.brain.fileCount(),
-        });
-    }
-    try stream.writeAll(buf.items);
-}
-
-fn handleProjectStatus(state: *GlobalState, stream: std.net.Stream, cwd: []const u8) !void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
-
-    const root = detectProjectRoot(state.allocator, cwd) catch {
-        try stream.writeAll("ERR: cannot detect project root\n");
-        return;
-    };
-    defer state.allocator.free(root);
-
-    if (state.projects.get(root)) |project| {
-        var resp_buf: [512]u8 = undefined;
-        const resp = try std.fmt.bufPrint(&resp_buf, "OK {s}: {d} units, {d} files\n", .{
-            project.root_dir, project.brain.unitCount(), project.brain.fileCount(),
-        });
-        try stream.writeAll(resp);
+        if (state.projects.get(root)) |project| {
+            res.body = try std.fmt.allocPrint(res.arena, "OK {s}: {d} units, {d} files\n", .{
+                project.root_dir, project.brain.unitCount(), project.brain.fileCount(),
+            });
+        } else {
+            res.body = "OK project not yet loaded (will auto-load on first query)\n";
+        }
     } else {
-        try stream.writeAll("OK project not yet loaded (will auto-load on first query)\n");
+        // Global status
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.print(res.arena, "opty global: {d} projects loaded\n", .{state.projects.count()});
+        var it = state.projects.iterator();
+        while (it.next()) |entry| {
+            const p = entry.value_ptr.*;
+            try buf.print(res.arena, "  {s}: {d} units, {d} files\n", .{
+                p.root_dir, p.brain.unitCount(), p.brain.fileCount(),
+            });
+        }
+        res.body = buf.items;
     }
 }
 
-fn handleReindex(state: *GlobalState, stream: std.net.Stream, cwd: []const u8) !void {
+fn handleReindexRoute(state: *GlobalState, req: *httpz.Request, res: *httpz.Response) !void {
+    const json_body = req.body();
+
     state.mutex.lock();
     defer state.mutex.unlock();
 
-    const project = state.getOrCreateProject(cwd) catch {
-        try stream.writeAll("ERR: cannot load project\n");
-        return;
-    };
+    if (json_body) |body| {
+        const parsed = std.json.parseFromSlice(std.json.Value, state.allocator, body, .{}) catch {
+            // No valid JSON body — reindex all
+            return reindexAll(state, res);
+        };
+        defer parsed.deinit();
 
-    // Clear mtimes to force full rescan
-    var mtime_it = project.file_mtimes.iterator();
-    while (mtime_it.next()) |entry| state.allocator.free(entry.key_ptr.*);
-    project.file_mtimes.clearAndFree();
+        if (jStr(parsed.value, "cwd")) |cwd| {
+            const project = state.getOrCreateProject(cwd) catch {
+                res.status = 500;
+                res.body = "ERR: cannot load project";
+                return;
+            };
 
-    for (project.brain.entries.items) |entry| {
-        state.allocator.free(entry.unit.name);
-        state.allocator.free(entry.unit.signature);
-        state.allocator.free(entry.unit.file_path);
-        state.allocator.free(entry.unit.module_name);
+            // Clear mtimes to force full rescan
+            var mtime_it = project.file_mtimes.iterator();
+            while (mtime_it.next()) |entry| state.allocator.free(entry.key_ptr.*);
+            project.file_mtimes.clearAndFree();
+
+            for (project.brain.entries.items) |entry| {
+                state.allocator.free(entry.unit.name);
+                state.allocator.free(entry.unit.signature);
+                state.allocator.free(entry.unit.file_path);
+                state.allocator.free(entry.unit.module_name);
+            }
+            project.brain.entries.clearRetainingCapacity();
+
+            scanAndIndex(state.allocator, &project.brain, &project.file_mtimes, project.root_dir) catch {};
+
+            res.body = try std.fmt.allocPrint(res.arena, "OK reindexed {s}: {d} units, {d} files\n", .{
+                project.root_dir, project.brain.unitCount(), project.brain.fileCount(),
+            });
+            return;
+        }
     }
-    project.brain.entries.clearRetainingCapacity();
 
-    scanAndIndex(state.allocator, &project.brain, &project.file_mtimes, project.root_dir) catch {};
-
-    var resp_buf: [256]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&resp_buf, "OK reindexed {s}: {d} units, {d} files\n", .{
-        project.root_dir, project.brain.unitCount(), project.brain.fileCount(),
-    });
-    try stream.writeAll(resp);
+    return reindexAll(state, res);
 }
 
-fn handleReindexAll(state: *GlobalState, stream: std.net.Stream) !void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
-
+fn reindexAll(state: *GlobalState, res: *httpz.Response) !void {
     var it = state.projects.iterator();
     while (it.next()) |entry| {
         const project = entry.value_ptr.*;
         scanAndIndex(state.allocator, &project.brain, &project.file_mtimes, project.root_dir) catch {};
     }
 
-    var resp_buf: [256]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&resp_buf, "OK reindexed {d} projects\n", .{state.projects.count()});
-    try stream.writeAll(resp);
+    res.body = try std.fmt.allocPrint(res.arena, "OK reindexed {d} projects\n", .{state.projects.count()});
 }
+
+fn handleShutdownRoute(state: *GlobalState, _: *httpz.Request, res: *httpz.Response) !void {
+    state.running = false;
+    res.body = "OK shutting down\n";
+    if (state.http_server) |server_ptr| {
+        const server: *HttpServer = @ptrCast(@alignCast(server_ptr));
+        server.stop();
+    }
+}
+
+fn handleMcpRoute(state: *GlobalState, req: *httpz.Request, res: *httpz.Response) !void {
+    const body = req.body() orelse {
+        res.status = 400;
+        res.body = "Missing request body";
+        return;
+    };
+
+    res.content_type = .JSON;
+
+    // Try to extract cwd from tools/call arguments for project routing
+    const maybe_cwd = mcp.extractCwdFromRequest(state.allocator, body);
+    defer if (maybe_cwd) |c| state.allocator.free(c);
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    if (maybe_cwd) |cwd| {
+        // Route to specific project
+        const project = state.getOrCreateProject(cwd) catch {
+            res.status = 500;
+            res.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Cannot load project\"}}";
+            return;
+        };
+        const response = mcp.handleHttpRequest(state.allocator, body, &project.brain, &project.file_mtimes, project.root_dir) catch {
+            res.status = 500;
+            res.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}";
+            return;
+        };
+        if (response) |resp| {
+            defer state.allocator.free(resp);
+            res.body = try std.fmt.allocPrint(res.arena, "{s}", .{resp});
+        } else {
+            res.status = 204;
+        }
+    } else {
+        // Non-tool-call methods (initialize, tools/list, ping, etc.) don't need project context.
+        // Use a temporary empty brain for dispatch.
+        var dummy_brain = brain_mod.Brain.init(state.allocator);
+        defer dummy_brain.deinit();
+        var dummy_mtimes = std.StringHashMap(i128).init(state.allocator);
+        defer dummy_mtimes.deinit();
+
+        const response = mcp.handleHttpRequest(state.allocator, body, &dummy_brain, &dummy_mtimes, ".") catch {
+            res.status = 500;
+            res.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}";
+            return;
+        };
+        if (response) |resp| {
+            defer state.allocator.free(resp);
+            res.body = try std.fmt.allocPrint(res.arena, "{s}", .{resp});
+        } else {
+            res.status = 204;
+        }
+    }
+}
+
+// --- JSON helper ---
+
+fn jStr(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
+    const v = val.object.get(key) orelse return null;
+    if (v != .string) return null;
+    return v.string;
+}
+
+// --- Watch loop ---
 
 fn watchLoop(state: *GlobalState) void {
     while (state.running) {

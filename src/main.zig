@@ -40,19 +40,25 @@ pub fn main() !void {
         }
         const query_text = try joinArgs(alloc, args[2..]);
         defer alloc.free(query_text);
-        try sendCommand(alloc, port, query_text, "QUERY ");
+        const cwd = getCwd();
+        const body = try std.fmt.allocPrint(alloc, "{{\"cwd\":\"{s}\",\"query\":\"{s}\"}}", .{ cwd, query_text });
+        defer alloc.free(body);
+        try httpPost(alloc, port, "/query", body);
     } else if (std.mem.eql(u8, cmd, "status")) {
-        try sendCommand(alloc, port, "", "STATUS");
+        const cwd = getCwd();
+        const path = try std.fmt.allocPrint(alloc, "/status?cwd={s}", .{cwd});
+        defer alloc.free(path);
+        try httpGet(alloc, port, path);
     } else if (std.mem.eql(u8, cmd, "stop")) {
-        try sendCommand(alloc, port, "", "SHUTDOWN");
+        try httpPost(alloc, port, "/shutdown", "");
     } else if (std.mem.eql(u8, cmd, "reindex")) {
-        try sendCommand(alloc, port, "", "REINDEX");
+        const cwd = getCwd();
+        const body = try std.fmt.allocPrint(alloc, "{{\"cwd\":\"{s}\"}}", .{cwd});
+        defer alloc.free(body);
+        try httpPost(alloc, port, "/reindex", body);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         const root = if (args.len > 2 and !std.mem.startsWith(u8, args[2], "-")) args[2] else ".";
         try mcp.run(alloc, root);
-    } else if (std.mem.eql(u8, cmd, "mcp-client")) {
-        const root = if (args.len > 2 and !std.mem.startsWith(u8, args[2], "-")) args[2] else getCwd();
-        try mcp.runClient(alloc, root, port);
     } else if (std.mem.eql(u8, cmd, "oneshot")) {
         if (args.len < 3) {
             std.debug.print("usage: opty oneshot <query> [--dir <path>]\n", .{});
@@ -77,53 +83,88 @@ fn printUsage() void {
         \\opty - HDC-powered codebase context optimizer for LLMs
         \\
         \\USAGE:
-        \\  opty daemon [dir] [--port N]    Start single-project daemon
-        \\  opty global        [--port N]   Start global multi-project daemon
+        \\  opty daemon [dir] [--port N]    Start single-project daemon (HTTP)
+        \\  opty global        [--port N]   Start global multi-project daemon (HTTP)
         \\  opty query <text>  [--port N]   Query the running daemon
         \\  opty status        [--port N]   Show daemon status
         \\  opty reindex       [--port N]   Force re-index
         \\  opty stop          [--port N]   Stop the daemon
         \\  opty mcp [dir]                  MCP server (stdio, standalone)
-        \\  opty mcp-client [dir] [--port N] MCP server backed by global daemon
         \\  opty oneshot <query> [--dir D]  One-shot query (no daemon)
         \\  opty version                    Show version
         \\
         \\The daemon indexes your codebase using Hyperdimensional Computing
         \\and produces minimal TOON-format context for LLM API calls.
+        \\The daemon exposes an HTTP API on localhost and an MCP endpoint at /mcp.
         \\
     ;
     std.debug.print("{s}", .{usage});
 }
 
-fn sendCommand(alloc: std.mem.Allocator, port: u16, payload: []const u8, prefix: []const u8) !void {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+// --- HTTP Client ---
 
+fn httpPost(alloc: std.mem.Allocator, port: u16, path: []const u8, body: []const u8) !void {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
     const stream = std.net.tcpConnectToAddress(addr) catch {
         std.debug.print("error: cannot connect to daemon on port {d}. Is it running?\n", .{port});
         return;
     };
     defer stream.close();
 
-    // Build command with CWD for global daemon routing
-    const cwd = getCwd();
-    const msg = if (std.mem.eql(u8, prefix, "QUERY "))
-        try std.fmt.allocPrint(alloc, "QUERY {s}\t{s}\n", .{ cwd, payload })
-    else if (std.mem.eql(u8, prefix, "SHUTDOWN"))
-        try std.fmt.allocPrint(alloc, "SHUTDOWN\n", .{})
-    else
-        try std.fmt.allocPrint(alloc, "{s} {s}\n", .{ prefix, cwd });
-    defer alloc.free(msg);
-    try stream.writeAll(msg);
+    // Build HTTP request
+    const content_len = body.len;
+    const header = try std.fmt.allocPrint(alloc, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Length: {d}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n", .{ path, port, content_len });
+    defer alloc.free(header);
+    try stream.writeAll(header);
+    if (body.len > 0) {
+        try stream.writeAll(body);
+    }
 
-    // Read response
-    const stdout = std.fs.File.stdout();
-    var buf: [65536]u8 = undefined;
+    try readAndPrintBody(alloc, stream);
+}
+
+fn httpGet(alloc: std.mem.Allocator, port: u16, path: []const u8) !void {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    const stream = std.net.tcpConnectToAddress(addr) catch {
+        std.debug.print("error: cannot connect to daemon on port {d}. Is it running?\n", .{port});
+        return;
+    };
+    defer stream.close();
+
+    const header = try std.fmt.allocPrint(alloc, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{ path, port });
+    defer alloc.free(header);
+    try stream.writeAll(header);
+
+    try readAndPrintBody(alloc, stream);
+}
+
+fn readAndPrintBody(alloc: std.mem.Allocator, stream: std.net.Stream) !void {
+    // Read full response
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(alloc);
+    var read_buf: [8192]u8 = undefined;
     while (true) {
-        const n = stream.read(&buf) catch break;
+        const n = stream.read(&read_buf) catch break;
         if (n == 0) break;
-        try stdout.writeAll(buf[0..n]);
+        try resp.appendSlice(alloc, read_buf[0..n]);
+    }
+
+    // Find end of HTTP headers and print body
+    const stdout = std.fs.File.stdout();
+    if (std.mem.indexOf(u8, resp.items, "\r\n\r\n")) |header_end| {
+        const body_text = resp.items[header_end + 4 ..];
+        if (body_text.len > 0) {
+            try stdout.writeAll(body_text);
+        }
+    } else {
+        // No headers found — print everything (shouldn't happen)
+        if (resp.items.len > 0) {
+            try stdout.writeAll(resp.items);
+        }
     }
 }
+
+// --- Oneshot ---
 
 fn oneshotQuery(alloc: std.mem.Allocator, root: []const u8, query_text: []const u8) !void {
     var brain = brain_mod.Brain.init(alloc);
@@ -171,6 +212,8 @@ fn oneshotQuery(alloc: std.mem.Allocator, root: []const u8, query_text: []const 
         try stdout.writeAll(output);
     }
 }
+
+// --- Helpers ---
 
 fn joinArgs(alloc: std.mem.Allocator, args: []const []const u8) ![]const u8 {
     var total: usize = 0;

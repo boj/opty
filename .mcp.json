@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "opty": {
-      "command": "/home/bojo/.local/bin/opty",
-      "args": ["mcp-client"]
+      "type": "http",
+      "url": "http://localhost:7390/mcp"
     }
   }
 }
