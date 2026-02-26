@@ -1,15 +1,18 @@
 const std = @import("std");
+const httpz = @import("httpz");
 const brain_mod = @import("brain.zig");
 const encoder = @import("encoder.zig");
 const parser = @import("parser.zig");
 const toon = @import("toon.zig");
 const ignore = @import("ignore.zig");
+const mcp = @import("mcp.zig");
 const Brain = brain_mod.Brain;
 const Allocator = std.mem.Allocator;
 
 const DEFAULT_PORT: u16 = 7390;
 const WATCH_INTERVAL_NS: u64 = 500 * std.time.ns_per_ms;
-const MAX_REQUEST_SIZE: usize = 8192;
+
+const HttpServer = httpz.Server(*DaemonState);
 
 pub const DaemonState = struct {
     brain: Brain,
@@ -18,6 +21,7 @@ pub const DaemonState = struct {
     file_mtimes: std.StringHashMap(i128),
     running: bool = true,
     port: u16 = DEFAULT_PORT,
+    http_server: ?*anyopaque = null,
 
     pub fn init(allocator: Allocator, root_dir: []const u8) DaemonState {
         return .{
@@ -46,7 +50,7 @@ pub fn run(allocator: Allocator, root_dir: []const u8, port: u16) !void {
     const stderr = std.fs.File.stderr();
     var msg_buf: [256]u8 = undefined;
 
-    var msg = try std.fmt.bufPrint(&msg_buf, "opty daemon starting on 127.0.0.1:{d}\n", .{port});
+    var msg = try std.fmt.bufPrint(&msg_buf, "opty daemon starting on http://127.0.0.1:{d}\n", .{port});
     _ = try stderr.write(msg);
     msg = try std.fmt.bufPrint(&msg_buf, "indexing {s}...\n", .{root_dir});
     _ = try stderr.write(msg);
@@ -62,65 +66,47 @@ pub fn run(allocator: Allocator, root_dir: []const u8, port: u16) !void {
     const watch_thread = try std.Thread.spawn(.{}, watchLoop, .{&state});
     defer watch_thread.join();
 
-    try serveLoop(&state);
-}
-
-fn serveLoop(state: *DaemonState) !void {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, state.port);
-    var server = try addr.listen(.{ .reuse_address = true });
+    var server = try HttpServer.init(allocator, .{
+        .address = .{ .addr = .initIp4(.{ 127, 0, 0, 1 }, port) },
+        .thread_pool = .{ .count = 4 },
+        .request = .{ .max_body_size = 65536 },
+    }, &state);
     defer server.deinit();
+    state.http_server = @ptrCast(&server);
 
-    while (state.running) {
-        const conn = server.accept() catch |err| {
-            if (err == error.WouldBlock) {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
-                continue;
-            }
-            return err;
-        };
-        defer conn.stream.close();
-        handleClient(state, conn.stream) catch |err| {
-            std.log.err("client error: {}", .{err});
-        };
-    }
+    var router = try server.router(.{});
+    router.post("/query", handleQueryRoute, .{});
+    router.get("/status", handleStatusRoute, .{});
+    router.post("/reindex", handleReindexRoute, .{});
+    router.post("/shutdown", handleShutdownRoute, .{});
+    router.post("/mcp", handleMcpRoute, .{});
+
+    try server.listen();
 }
 
-fn handleClient(state: *DaemonState, stream: std.net.Stream) !void {
-    var buf: [MAX_REQUEST_SIZE]u8 = undefined;
-    const n = stream.read(&buf) catch return;
-    if (n == 0) return;
+// --- HTTP Route Handlers ---
 
-    const request = std.mem.trim(u8, buf[0..n], " \t\r\n");
+fn handleQueryRoute(state: *DaemonState, req: *httpz.Request, res: *httpz.Response) !void {
+    const json_body = req.body() orelse {
+        res.status = 400;
+        res.body = "Missing request body";
+        return;
+    };
 
-    if (std.mem.startsWith(u8, request, "QUERY ")) {
-        const payload = request[6..];
-        // Strip CWD prefix if tab-separated (sent by global-aware clients)
-        const query_text = if (std.mem.indexOfScalar(u8, payload, '\t')) |tab_pos|
-            payload[tab_pos + 1 ..]
-        else
-            payload;
-        try handleQuery(state, stream, query_text);
-    } else if (std.mem.startsWith(u8, request, "STATUS")) {
-        try handleStatus(state, stream);
-    } else if (std.mem.startsWith(u8, request, "REINDEX")) {
-        state.brain.mutex.lock();
-        defer state.brain.mutex.unlock();
-        try scanAndIndex(state);
-        var resp_buf: [256]u8 = undefined;
-        const resp = try std.fmt.bufPrint(&resp_buf, "OK reindexed: {d} units, {d} files\n", .{
-            state.brain.unitCount(),
-            state.brain.fileCount(),
-        });
-        try stream.writeAll(resp);
-    } else if (std.mem.startsWith(u8, request, "SHUTDOWN")) {
-        state.running = false;
-        try stream.writeAll("OK shutting down\n");
-    } else {
-        try stream.writeAll("ERR unknown command\n");
-    }
-}
+    const parsed = std.json.parseFromSlice(std.json.Value, state.allocator, json_body, .{}) catch {
+        res.status = 400;
+        res.body = "Invalid JSON";
+        return;
+    };
+    defer parsed.deinit();
 
-fn handleQuery(state: *DaemonState, stream: std.net.Stream, query_text: []const u8) !void {
+    const root = parsed.value;
+    const query_text = jStr(root, "query") orelse {
+        res.status = 400;
+        res.body = "Missing 'query' field";
+        return;
+    };
+
     state.brain.mutex.lock();
     defer state.brain.mutex.unlock();
 
@@ -129,27 +115,77 @@ fn handleQuery(state: *DaemonState, stream: std.net.Stream, query_text: []const 
     defer state.allocator.free(results);
 
     if (results.len == 0) {
-        try stream.writeAll("# no matching code units found\n");
+        res.body = "# no matching code units found\n";
         return;
     }
 
     const output = try toon.formatResults(state.allocator, results, .signatures);
     defer state.allocator.free(output);
-    try stream.writeAll(output);
+    res.body = try std.fmt.allocPrint(res.arena, "{s}", .{output});
 }
 
-fn handleStatus(state: *DaemonState, stream: std.net.Stream) !void {
+fn handleStatusRoute(state: *DaemonState, _: *httpz.Request, res: *httpz.Response) !void {
     state.brain.mutex.lock();
     defer state.brain.mutex.unlock();
-    var resp_buf: [512]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&resp_buf, "OK watching {s}: {d} units, {d} files, {d} bytes memory\n", .{
+    res.body = try std.fmt.allocPrint(res.arena, "OK watching {s}: {d} units, {d} files, {d} bytes memory\n", .{
         state.root_dir,
         state.brain.unitCount(),
         state.brain.fileCount(),
         state.brain.entries.items.len * @sizeOf(brain_mod.BrainEntry),
     });
-    try stream.writeAll(resp);
 }
+
+fn handleReindexRoute(state: *DaemonState, _: *httpz.Request, res: *httpz.Response) !void {
+    state.brain.mutex.lock();
+    defer state.brain.mutex.unlock();
+    scanAndIndex(state) catch {};
+    res.body = try std.fmt.allocPrint(res.arena, "OK reindexed: {d} units, {d} files\n", .{
+        state.brain.unitCount(),
+        state.brain.fileCount(),
+    });
+}
+
+fn handleShutdownRoute(state: *DaemonState, _: *httpz.Request, res: *httpz.Response) !void {
+    state.running = false;
+    res.body = "OK shutting down\n";
+    if (state.http_server) |server_ptr| {
+        const server: *HttpServer = @ptrCast(@alignCast(server_ptr));
+        server.stop();
+    }
+}
+
+fn handleMcpRoute(state: *DaemonState, req: *httpz.Request, res: *httpz.Response) !void {
+    const body = req.body() orelse {
+        res.status = 400;
+        res.body = "Missing request body";
+        return;
+    };
+
+    res.content_type = .JSON;
+    const response = mcp.handleHttpRequest(state.allocator, body, &state.brain, &state.file_mtimes, state.root_dir) catch {
+        res.status = 500;
+        res.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}";
+        return;
+    };
+
+    if (response) |resp| {
+        defer state.allocator.free(resp);
+        res.body = try std.fmt.allocPrint(res.arena, "{s}", .{resp});
+    } else {
+        res.status = 204;
+    }
+}
+
+// --- JSON helper ---
+
+fn jStr(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
+    const v = val.object.get(key) orelse return null;
+    if (v != .string) return null;
+    return v.string;
+}
+
+// --- Watch loop ---
 
 fn watchLoop(state: *DaemonState) void {
     while (state.running) {
@@ -161,6 +197,8 @@ fn watchLoop(state: *DaemonState) void {
         };
     }
 }
+
+// --- File scanning ---
 
 fn scanAndIndex(state: *DaemonState) !void {
     var dir = std.fs.cwd().openDir(state.root_dir, .{ .iterate = true }) catch |err| {

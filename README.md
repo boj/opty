@@ -68,16 +68,41 @@ the index in memory. The file watcher updates all loaded projects every 2 second
 
 | Command | Description |
 |---|---|
-| `opty global [--port N]` | **Global multi-project daemon** — auto-loads projects on demand |
-| `opty daemon [dir] [--port N]` | Single-project daemon (foreground, default port 7390) |
+| `opty global [--port N]` | **Global multi-project daemon** — HTTP server, auto-loads projects on demand |
+| `opty daemon [dir] [--port N]` | Single-project daemon (HTTP server, default port 7390) |
 | `opty mcp [dir]` | Standalone MCP server over stdio (indexes locally) |
-| `opty mcp-client [--port N]` | MCP-to-daemon bridge (forwards to global daemon via TCP) |
-| `opty query <text> [--port N]` | Query the running daemon (sends CWD for project routing) |
+| `opty query <text> [--port N]` | Query the running daemon via HTTP |
 | `opty status [--port N]` | Show indexed file/unit counts for current project |
 | `opty reindex [--port N]` | Force full re-index of current project |
 | `opty stop [--port N]` | Shut down the daemon |
 | `opty oneshot <query> [--dir D]` | Index + query in one shot (no daemon) |
 | `opty version` | Show version |
+
+### HTTP API
+
+The daemon exposes an HTTP API on `http://127.0.0.1:<port>`:
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| POST | `/query` | `{"cwd": "...", "query": "..."}` | TOON-format results |
+| GET | `/status` | query param `?cwd=...` (optional) | Status text |
+| POST | `/reindex` | `{"cwd": "..."}` (optional) | Confirmation text |
+| POST | `/shutdown` | — | "OK shutting down" |
+| POST | `/mcp` | JSON-RPC body | MCP JSON-RPC response |
+
+```bash
+# Query directly via curl
+curl -X POST http://localhost:7390/query \
+  -d '{"cwd":"/path/to/project","query":"error handling"}'
+
+# Check status
+curl http://localhost:7390/status
+
+# MCP JSON-RPC
+curl -X POST http://localhost:7390/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
 ## Example Output (TOON format)
 
@@ -122,24 +147,23 @@ instead of reading every file.
 
 ### Adding MCP to Your Project
 
-Drop a `.mcp.json` in your project root. With the **global daemon** running, use `mcp-client`
-(lightweight bridge that forwards to the daemon via TCP):
+Drop a `.mcp.json` in your project root. With the **global daemon** running, use the
+HTTP MCP endpoint directly (no bridge process needed):
 
 ```json
 {
   "mcpServers": {
     "opty": {
-      "command": "/path/to/opty",
-      "args": ["mcp-client"]
+      "type": "http",
+      "url": "http://localhost:7390/mcp"
     }
   }
 }
 ```
 
-The `mcp-client` mode auto-detects the project from its working directory (set by
-the MCP host). No path configuration needed — just ensure the global daemon is running.
+Just ensure the global daemon is running (`opty global --port 7390`).
 
-For **standalone** mode (no daemon required — indexes locally in-process):
+For **standalone** mode (no daemon required — indexes locally in-process via stdio):
 
 ```json
 {
@@ -160,8 +184,8 @@ Add to `~/.claude/claude_desktop_config.json` (Desktop) or `~/.claude.json` (Cod
 {
   "mcpServers": {
     "opty": {
-      "command": "/path/to/opty",
-      "args": ["mcp-client"]
+      "type": "http",
+      "url": "http://localhost:7390/mcp"
     }
   }
 }
@@ -175,8 +199,8 @@ Add to `.vscode/mcp.json` in your workspace:
 {
   "servers": {
     "opty": {
-      "command": "/path/to/opty",
-      "args": ["mcp-client"]
+      "type": "http",
+      "url": "http://localhost:7390/mcp"
     }
   }
 }
@@ -188,10 +212,10 @@ Add `.mcp.json` to your project root (see above), then launch `copilot`
 from that directory. opty's tools appear automatically. You can also manage
 MCP servers with the `/mcp` slash command.
 
-### Generic MCP Client
+### Generic MCP Client (stdio)
 
 ```bash
-# opty speaks JSON-RPC 2.0 over stdio with Content-Length framing
+# opty also speaks JSON-RPC 2.0 over stdio with Content-Length framing
 opty mcp /path/to/project
 ```
 
@@ -376,14 +400,27 @@ Unregister-ScheduledTask -TaskName "opty-daemon" -Confirm:$false
 
 ### MCP on Windows
 
-The `.mcp.json` config uses the same format — just adjust paths:
+The `.mcp.json` config uses the same format — just ensure the global daemon is running:
+
+```json
+{
+  "mcpServers": {
+    "opty": {
+      "type": "http",
+      "url": "http://localhost:7390/mcp"
+    }
+  }
+}
+```
+
+For standalone stdio mode, adjust paths:
 
 ```json
 {
   "mcpServers": {
     "opty": {
       "command": "C:\\Users\\you\\.local\\bin\\opty.exe",
-      "args": ["mcp-client"]
+      "args": ["mcp", "."]
     }
   }
 }
