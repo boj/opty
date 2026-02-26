@@ -155,7 +155,17 @@ This is most useful as an **exploration tool** — helping the agent get oriente
 | `opty_query` | Semantic code search — finds functions/types/imports matching a natural language query |
 | `opty_status` | Index statistics — file count, code unit count, memory |
 | `opty_reindex` | Force full re-scan of the codebase |
-| `opty_ast` | Full depth-aware AST — returns functions, types, imports, fields, variables, and enum variants with nesting depth and line numbers. Pass `file` for a single file or omit for the entire project |
+| `opty_ast` | Depth-aware AST — returns functions, types, imports, fields, variables, and enum variants with nesting depth and line numbers |
+
+**`opty_ast` parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `file` | string or string[] | Single file path or array of paths (e.g. `"src/main.zig"` or `["src/brain.zig", "src/encoder.zig"]`) |
+| `pattern` | string | Glob pattern to filter files (e.g. `"src/*.zig"`, `"src/**/*.ts"`) |
+| `cwd` | string | Project working directory (used by global daemon) |
+
+Omit both `file` and `pattern` to get the full project AST. You can combine `file` and `pattern` — results are the union of both.
 
 ### Configuration
 
