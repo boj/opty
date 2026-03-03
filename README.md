@@ -2,6 +2,69 @@
 
 A semantic code search tool built with [Hyperdimensional Computing](https://en.wikipedia.org/wiki/Hyperdimensional_computing) (HDC). It indexes function signatures, type definitions, and imports from your codebase and lets you find them by concept rather than by name.
 
+## Examples
+
+**Quick start — one-shot query (no daemon):**
+```bash
+$ opty oneshot "authentication error handling" --dir ~/projects/myapp
+# indexed 1,247 units across 89 files
+functions[5]{name,signature,file,line}:
+handleAuthError,pub fn handleAuthError(err: AuthError) !Response {,src/auth.zig,156
+validateTokenOrFail,fn validateTokenOrFail(token: []const u8) !User {,src/auth.zig,203
+logAuthFailure,fn logAuthFailure(reason: []const u8, ip: []const u8) void {,src/logging.zig,78
+```
+
+**Start daemon for instant queries:**
+```bash
+$ opty daemon ~/projects/myapp &
+opty daemon on http://127.0.0.1:7390
+
+$ opty query "HTTP route handlers"
+functions[8]{name,signature,file,line}:
+handleGetUser,pub fn handleGetUser(req: *Request, res: *Response) !void {,src/routes/users.zig,12
+handleCreatePost,pub fn handleCreatePost(req: *Request, res: *Response) !void {,src/routes/posts.zig,45
+handleLogin,pub fn handleLogin(req: *Request, res: *Response) !void {,src/routes/auth.zig,23
+...
+
+$ opty query "database connection pooling"
+functions[3]{name,signature,file,line}:
+initPool,pub fn initPool(alloc: Allocator, config: PoolConfig) !Pool {,src/db/pool.zig,34
+acquireConnection,pub fn acquireConnection(pool: *Pool) !*Connection {,src/db/pool.zig,67
+releaseConnection,pub fn releaseConnection(pool: *Pool, conn: *Connection) void {,src/db/pool.zig,89
+```
+
+**Global daemon — works across all projects:**
+```bash
+$ opty global --port 7390 &
+
+$ cd ~/projects/api-server
+$ opty query "error types"        # auto-indexes api-server
+
+$ cd ~/projects/frontend
+$ opty query "React components"   # auto-indexes frontend
+
+$ opty status
+Project: /home/you/projects/api-server
+  Files: 142  Units: 2,891  Memory: 3.6 MB
+Project: /home/you/projects/frontend  
+  Files: 203  Units: 4,127  Memory: 5.1 MB
+```
+
+**Semantic search finds code by concept, not exact names:**
+```bash
+# Find authentication logic without knowing function names
+$ opty query "user login session management"
+→ handleLogin, createSession, validateSession, refreshToken
+
+# Discover error handling patterns
+$ opty query "handle failures and errors"  
+→ handleError, tryParseOrFail, logFailure, unwrapOrDefault
+
+# Explore data structures
+$ opty query "user data models"
+→ User struct, UserProfile struct, UserSettings struct
+```
+
 ## When to use opty vs grep
 
 opty and grep solve different problems. Use the right tool for the job:
