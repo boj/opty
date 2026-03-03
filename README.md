@@ -282,6 +282,13 @@ systemctl --user enable --now opty-daemon
 
 The default service runs `opty global --port 7390`.
 
+**WSL:** If the service doesn't auto-start after WSL restarts, ensure systemd is enabled in `/etc/wsl.conf`:
+```ini
+[boot]
+systemd=true
+```
+Then verify linger is enabled: `loginctl show-user $USER | grep Linger=yes`. The updated service file uses `Restart=always` and waits for network to improve WSL compatibility.
+
 ### Windows (Task Scheduler)
 
 ```powershell

@@ -1,15 +1,19 @@
 [Unit]
 Description=opty — HDC-powered codebase context optimizer daemon
 Documentation=https://github.com/boj/opty
-After=default.target
+After=default.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/opty global --port 7390
-Restart=on-failure
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+# WSL-specific: ensure service stays running
+KillMode=mixed
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target
