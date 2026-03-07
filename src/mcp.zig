@@ -245,7 +245,7 @@ fn handleToolsList(alloc: Allocator, id: ?std.json.Value) ![]u8 {
             "\"description\":\"Group related code symbols into functional clusters by similarity. Discovers subsystems like 'auth', 'database', 'config'.\"," ++
             "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
             "\"threshold\":{\"type\":\"number\",\"description\":\"Similarity threshold 0.0-1.0 (default 0.15). Lower = larger clusters.\"}," ++
-            "\"min_size\":{\"type\":\"number\",\"description\":\"Minimum cluster size (default 2)\"},"
+            "\"min_size\":{\"type\":\"number\",\"description\":\"Minimum cluster size (default 2)\"}," ++
             "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}}}" ++
             "]}");
 }
