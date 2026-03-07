@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{github.workflow}}-${{github.ref}}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test parser
+    runs-on: ${{matrix.os}}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up tree-sitter
+        uses: tree-sitter/setup-action@v2
+        with:
+          install-lib: false
+      - name: Run tests
+        uses: tree-sitter/parser-test-action@v2
+        with:
+          test-rust: true
+          test-node: false
+          test-python: false
+          test-go: false
+          test-swift: false
+      - name: Set up examples
+        run: |-
+          git clone https://github.com/ziglang/zig examples/zig --branch 0.15.1 --single-branch --depth=1 --filter=blob:none
+      - name: Parse examples
+        uses: tree-sitter/parse-action@v4
+        with:
+          files: |
+            examples/**/*.zig
+            !examples/zig/doc/langref/Assembly Syntax Explained.zig
+            !examples/zig/doc/langref/inline_assembly.zig
+            !examples/zig/doc/langref/var_must_be_initialized.zig
+            !examples/zig/lib/compiler_rt/aarch64_outline_atomics.zig
+            !examples/zig/lib/compiler_rt/arm.zig
+            !examples/zig/lib/compiler_rt/atomics.zig
+            !examples/zig/lib/compiler_rt/clear_cache.zig
+            !examples/zig/lib/std/Thread.zig
+            !examples/zig/lib/std/builtin.zig
+            !examples/zig/lib/std/debug/SelfInfo.zig
+            !examples/zig/lib/std/debug.zig
+            !examples/zig/lib/std/mem.zig
+            !examples/zig/lib/std/os/linux/aarch64.zig
+            !examples/zig/lib/std/os/linux/arm.zig
+            !examples/zig/lib/std/os/linux/hexagon.zig
+            !examples/zig/lib/std/os/linux/loongarch64.zig
+            !examples/zig/lib/std/os/linux/m68k.zig
+            !examples/zig/lib/std/os/linux/mips.zig
+            !examples/zig/lib/std/os/linux/mips64.zig
+            !examples/zig/lib/std/os/linux/powerpc.zig
+            !examples/zig/lib/std/os/linux/powerpc64.zig
+            !examples/zig/lib/std/os/linux/riscv32.zig
+            !examples/zig/lib/std/os/linux/riscv64.zig
+            !examples/zig/lib/std/os/linux/s390x.zig
+            !examples/zig/lib/std/os/linux/sparc64.zig
+            !examples/zig/lib/std/os/linux/thumb.zig
+            !examples/zig/lib/std/os/linux/tls.zig
+            !examples/zig/lib/std/os/linux/x86.zig
+            !examples/zig/lib/std/os/linux/x86_64.zig
+            !examples/zig/lib/std/os/plan9/x86_64.zig
+            !examples/zig/lib/std/pie.zig
+            !examples/zig/lib/std/valgrind.zig
+            !examples/zig/lib/std/zig/llvm/Builder.zig
+            !examples/zig/lib/std/zig/system/x86.zig
+            !examples/zig/lib/std/zon/Serializer.zig
+            !examples/zig/lib/std/zon/parse.zig
+            !examples/zig/src/Compilation.zig
+            !examples/zig/test/behavior/asm.zig
+            !examples/zig/test/cases/llvm/f_segment_address_space_reading_and_writing.zig
+            !examples/zig/test/standalone/stack_iterator/unwind.zig
+            !examples/zig/test/standalone/stack_iterator/unwind_freestanding.zig
+          invalid-files: |
+            examples/zig/test/cases/compile_errors/@import_zon_bad_type.zig
+            examples/zig/test/cases/compile_errors/const_is_a_statement_not_an_expression.zig
+            examples/zig/test/cases/compile_errors/empty_char_lit.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-block_expr.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-block_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-comptime_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-comptime_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-defer.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-for_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-for_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if-else-if-else_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if-else-if-else_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if-else-if_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if-else-if_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if-else_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if-else_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-if_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-test_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-test_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-while-continue_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-while-continue_statement.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-while_expression.zig
+            examples/zig/test/cases/compile_errors/implicit_semicolon-while_statement.zig
+            examples/zig/test/cases/compile_errors/invalid_empty_unicode_escape.zig
+            examples/zig/test/cases/compile_errors/invalid_exponent_in_float_literal-1.zig
+            examples/zig/test/cases/compile_errors/invalid_exponent_in_float_literal-2.zig
+            examples/zig/test/cases/compile_errors/invalid_float_literal.zig
+            examples/zig/test/cases/compile_errors/invalid_legacy_unicode_escape.zig
+            examples/zig/test/cases/compile_errors/invalid_number_literals.zig
+            examples/zig/test/cases/compile_errors/invalid_pointer_syntax.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-10.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-11.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-12.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-13.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-14.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-2.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-3.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-4.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-5.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-6.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-7.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_float_literal-9.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_int_literal-1.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_int_literal-2.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_int_literal-3.zig
+            examples/zig/test/cases/compile_errors/invalid_underscore_placement_in_int_literal-4.zig
+            examples/zig/test/cases/compile_errors/invalid_unicode_escape.zig
+            examples/zig/test/cases/compile_errors/missing_digit_after_base.zig
+            examples/zig/test/cases/compile_errors/non-extern_function_with_var_args.zig
+            examples/zig/test/cases/compile_errors/normal_string_with_newline.zig
+
+  query:
+    name: Validate queries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up repository
+        uses: actions/checkout@v5
+
+      - name: Set up tree-sitter
+        uses: tree-sitter/setup-action@v2
+        with:
+          install-lib: false
+
+      - name: Build parser
+        run: tree-sitter build
+
+      - name: Set up ts_query_ls
+        run: curl -fL https://github.com/ribru17/ts_query_ls/releases/latest/download/ts_query_ls-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+
+      - name: Check queries
+        run: ./ts_query_ls check -f queries/

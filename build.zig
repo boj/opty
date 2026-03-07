@@ -21,25 +21,64 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    // This creates a module, which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Zig modules are the preferred way of making Zig code available to consumers.
-    // addModule defines a module that we intend to make available for importing
-    // to our consumers. We must give it a name because a Zig package can expose
-    // multiple modules and consumers will need to be able to specify which
-    // module they want to access.
+    // Build tree-sitter runtime as a static library
+    const ts_runtime = b.addLibrary(.{
+        .name = "tree-sitter",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    ts_runtime.root_module.addCSourceFile(.{
+        .file = b.path("deps/tree-sitter/lib/src/lib.c"),
+        .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
+    });
+    ts_runtime.root_module.addIncludePath(b.path("deps/tree-sitter/lib/include"));
+    ts_runtime.root_module.addIncludePath(b.path("deps/tree-sitter/lib/src"));
+
+    // Build tree-sitter-zig grammar
+    const ts_zig = b.addLibrary(.{
+        .name = "tree-sitter-zig",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    ts_zig.root_module.addCSourceFile(.{
+        .file = b.path("deps/tree-sitter-zig/src/parser.c"),
+        .flags = &.{"-std=c11"},
+    });
+    ts_zig.root_module.addIncludePath(b.path("deps/tree-sitter-zig/src"));
+
+    // Build tree-sitter-python grammar
+    const ts_python = b.addLibrary(.{
+        .name = "tree-sitter-python",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    ts_python.root_module.addCSourceFiles(.{
+        .files = &.{
+            "deps/tree-sitter-python/src/parser.c",
+            "deps/tree-sitter-python/src/scanner.c",
+        },
+        .root = b.path("."),
+        .flags = &.{"-std=c11"},
+    });
+    ts_python.root_module.addIncludePath(b.path("deps/tree-sitter-python/src"));
+
     const mod = b.addModule("opty", .{
-        // The root source file is the "entry point" of this module. Users of
-        // this module will only be able to access public declarations contained
-        // in this file, which means that if you have declarations that you
-        // intend to expose to consumers that were defined in other files part
-        // of this module, you will have to make sure to re-export them from
-        // the root file.
         .root_source_file = b.path("src/root.zig"),
-        // Later on we'll use this module as the root module of a test executable
-        // which requires us to specify a target.
         .target = target,
     });
+    mod.addIncludePath(b.path("deps/tree-sitter/lib/include"));
+    mod.linkLibrary(ts_runtime);
+    mod.linkLibrary(ts_zig);
+    mod.linkLibrary(ts_python);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function

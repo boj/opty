@@ -7,6 +7,13 @@ pub const daemon = @import("daemon.zig");
 pub const mcp = @import("mcp.zig");
 pub const global = @import("global.zig");
 pub const ignore = @import("ignore.zig");
+pub const treesitter = @import("treesitter.zig");
+pub const refs = @import("refs.zig");
+pub const bm25 = @import("bm25.zig");
+pub const changes = @import("changes.zig");
+pub const impact = @import("impact.zig");
+pub const context = @import("context.zig");
+pub const cluster = @import("cluster.zig");
 
 test {
     _ = hdc;
@@ -15,4 +22,11 @@ test {
     _ = brain;
     _ = mcp;
     _ = ignore;
+    _ = treesitter;
+    _ = refs;
+    _ = bm25;
+    _ = changes;
+    _ = impact;
+    _ = context;
+    _ = cluster;
 }

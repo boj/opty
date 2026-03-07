@@ -4,9 +4,13 @@ const encoder = @import("encoder.zig");
 const parser = @import("parser.zig");
 const toon = @import("toon.zig");
 const ignore = @import("ignore.zig");
+const changes_mod = @import("changes.zig");
+const impact_mod = @import("impact.zig");
+const context_mod = @import("context.zig");
+const cluster_mod = @import("cluster.zig");
 const Allocator = std.mem.Allocator;
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const PROTOCOL_VERSION = "2024-11-05";
 
 /// Run the MCP server over stdio (JSON-RPC 2.0 with Content-Length framing).
@@ -207,6 +211,41 @@ fn handleToolsList(alloc: Allocator, id: ?std.json.Value) ![]u8 {
             "\"description\":\"Relative file path (e.g. 'src/main.zig'). Omit for full project AST. " ++
             "Pass an array for multiple files (e.g. ['src/main.zig', 'src/brain.zig']).\"}," ++
             "\"pattern\":{\"type\":\"string\",\"description\":\"Glob pattern to filter files (e.g. 'src/*.zig', 'src/**/*.ts'). Can be combined with 'file'.\"}," ++
+            "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}}}," ++
+            // opty_refs
+            "{\"name\":\"opty_refs\"," ++
+            "\"description\":\"Find cross-file references for a symbol. Shows where a function/type is defined and which files import it.\"," ++
+            "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
+            "\"symbol\":{\"type\":\"string\",\"description\":\"Symbol name to look up (e.g. 'handleAuth')\"}," ++
+            "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}," ++
+            "\"required\":[\"symbol\"]}}," ++
+            // opty_impact
+            "{\"name\":\"opty_impact\"," ++
+            "\"description\":\"Blast radius analysis. Shows what code is affected if a symbol changes, with confidence scores by depth.\"," ++
+            "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
+            "\"symbol\":{\"type\":\"string\",\"description\":\"Symbol name to analyze (e.g. 'handleAuth')\"}," ++
+            "\"max_depth\":{\"type\":\"number\",\"description\":\"Max traversal depth (default 2)\"}," ++
+            "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}," ++
+            "\"required\":[\"symbol\"]}}," ++
+            // opty_context
+            "{\"name\":\"opty_context\"," ++
+            "\"description\":\"360-degree symbol context. Returns definition, callers, dependencies, and sibling symbols in one call.\"," ++
+            "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
+            "\"symbol\":{\"type\":\"string\",\"description\":\"Symbol name to get context for (e.g. 'handleAuth')\"}," ++
+            "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}," ++
+            "\"required\":[\"symbol\"]}}," ++
+            // opty_changes
+            "{\"name\":\"opty_changes\"," ++
+            "\"description\":\"Map git diff to affected code symbols. Shows which functions/types were modified, added, or deleted.\"," ++
+            "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
+            "\"diff_target\":{\"type\":\"string\",\"description\":\"Git diff target (default 'HEAD'). Use '' for unstaged, 'HEAD~1' for last commit, or a commit SHA.\"}," ++
+            "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}}}," ++
+            // opty_clusters
+            "{\"name\":\"opty_clusters\"," ++
+            "\"description\":\"Group related code symbols into functional clusters by similarity. Discovers subsystems like 'auth', 'database', 'config'.\"," ++
+            "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
+            "\"threshold\":{\"type\":\"number\",\"description\":\"Similarity threshold 0.0-1.0 (default 0.15). Lower = larger clusters.\"}," ++
+            "\"min_size\":{\"type\":\"number\",\"description\":\"Minimum cluster size (default 2)\"},"
             "\"cwd\":{\"type\":\"string\",\"description\":\"Project working directory for routing (used by global daemon)\"}}}}" ++
             "]}");
 }
@@ -233,6 +272,16 @@ fn handleToolsCall(
         return try toolReindex(alloc, id, brain, file_mtimes, root_dir);
     } else if (eql(name, "opty_ast")) {
         return try toolAst(alloc, id, args, root_dir);
+    } else if (eql(name, "opty_refs")) {
+        return try toolRefs(alloc, id, args, brain);
+    } else if (eql(name, "opty_impact")) {
+        return try toolImpact(alloc, id, args, brain);
+    } else if (eql(name, "opty_context")) {
+        return try toolContext(alloc, id, args, brain);
+    } else if (eql(name, "opty_changes")) {
+        return try toolChanges(alloc, id, args, brain, root_dir);
+    } else if (eql(name, "opty_clusters")) {
+        return try toolClusters(alloc, id, args, brain);
     } else {
         return try callError(alloc, id, "Unknown tool");
     }
@@ -262,7 +311,9 @@ fn toolQuery(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, brain
     defer brain.mutex.unlock();
 
     const query_vec = try encoder.encodeQuery(alloc, query_text);
-    const results = try brain.query(alloc, query_vec, top_k);
+    // Use hybrid search (BM25 + HDC via reciprocal rank fusion)
+    const results = brain.hybridQuery(alloc, query_text, query_vec, top_k) catch
+        try brain.query(alloc, query_vec, top_k);
     defer alloc.free(results);
 
     if (results.len == 0) return try callText(alloc, id, "No matching code units found.");
@@ -493,6 +544,178 @@ fn astProject(alloc: Allocator, id: ?std.json.Value, root_dir: []const u8) ![]u8
     try buf.print(alloc, "ast{{root:\"{s}\",files:{d},nodes:{d}}}\n", .{ root_dir, file_count, total_nodes });
     try buf.appendSlice(alloc, file_buf.items);
     const output = try buf.toOwnedSlice(alloc);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
+
+// --- New tool implementations ---
+
+fn toolRefs(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, brain: *brain_mod.Brain) ![]u8 {
+    const symbol: []const u8 = blk: {
+        if (args) |a| {
+            if (jStr(a, "symbol")) |s| break :blk s;
+        }
+        break :blk "";
+    };
+    if (symbol.len == 0) return try callError(alloc, id, "Missing required argument: symbol");
+
+    brain.mutex.lock();
+    defer brain.mutex.unlock();
+
+    const ref_map = brain.getRefMap() catch return try callError(alloc, id, "Failed to build reference map");
+
+    var buf: std.ArrayList(u8) = .empty;
+
+    // Definitions
+    if (ref_map.findDefinition(symbol)) |defs| {
+        try buf.print(alloc, "definitions[{d}]{{name,kind,file,line}}:\n", .{defs.len});
+        for (defs) |def| {
+            const kind_str = switch (def.kind) {
+                .function => "fn",
+                .type_def => "type",
+                .import_decl => "import",
+            };
+            try buf.print(alloc, "{s},{s},{s},{d}\n", .{ def.name, kind_str, def.file_path, def.line_number });
+        }
+    } else {
+        try buf.appendSlice(alloc, "definitions[0]{name,kind,file,line}:\n");
+    }
+
+    // References
+    if (ref_map.findReferences(symbol)) |ref_locs| {
+        try buf.print(alloc, "references[{d}]{{import_name,file,line}}:\n", .{ref_locs.len});
+        for (ref_locs) |ref_loc| {
+            try buf.print(alloc, "{s},{s},{d}\n", .{ ref_loc.import_name, ref_loc.file_path, ref_loc.line_number });
+        }
+    } else {
+        try buf.appendSlice(alloc, "references[0]{import_name,file,line}:\n");
+    }
+
+    const output = try buf.toOwnedSlice(alloc);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
+
+fn toolImpact(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, brain: *brain_mod.Brain) ![]u8 {
+    const symbol: []const u8 = blk: {
+        if (args) |a| {
+            if (jStr(a, "symbol")) |s| break :blk s;
+        }
+        break :blk "";
+    };
+    if (symbol.len == 0) return try callError(alloc, id, "Missing required argument: symbol");
+
+    const max_depth: u16 = blk: {
+        if (args) |a| {
+            if (jInt(a, "max_depth")) |d| {
+                if (d > 0 and d <= 10) break :blk @intCast(d);
+            }
+        }
+        break :blk 2;
+    };
+
+    brain.mutex.lock();
+    defer brain.mutex.unlock();
+
+    const ref_map = brain.getRefMap() catch return try callError(alloc, id, "Failed to build reference map");
+
+    const result = impact_mod.analyzeImpact(alloc, ref_map, symbol, max_depth) catch
+        return try callError(alloc, id, "Impact analysis failed");
+    defer {
+        for (result.entries) |e| {
+            alloc.free(e.name);
+            alloc.free(e.file_path);
+        }
+        alloc.free(result.entries);
+    }
+
+    const output = try impact_mod.formatImpact(alloc, result);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
+
+fn toolContext(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, brain: *brain_mod.Brain) ![]u8 {
+    const symbol: []const u8 = blk: {
+        if (args) |a| {
+            if (jStr(a, "symbol")) |s| break :blk s;
+        }
+        break :blk "";
+    };
+    if (symbol.len == 0) return try callError(alloc, id, "Missing required argument: symbol");
+
+    brain.mutex.lock();
+    defer brain.mutex.unlock();
+
+    const ref_map = brain.getRefMap() catch return try callError(alloc, id, "Failed to build reference map");
+
+    var ctx = context_mod.getContext(alloc, ref_map, brain.entries.items, symbol) catch
+        return try callError(alloc, id, "Context lookup failed");
+    defer ctx.deinit(alloc);
+
+    const output = try context_mod.formatContext(alloc, ctx);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
+
+fn toolChanges(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, brain: *brain_mod.Brain, root_dir: []const u8) ![]u8 {
+    const diff_target: []const u8 = blk: {
+        if (args) |a| {
+            if (jStr(a, "diff_target")) |t| break :blk t;
+        }
+        break :blk "HEAD";
+    };
+
+    brain.mutex.lock();
+    defer brain.mutex.unlock();
+
+    const changed = changes_mod.detectChanges(alloc, root_dir, brain.entries.items, diff_target) catch
+        return try callError(alloc, id, "Failed to detect changes (is this a git repository?)");
+    defer {
+        for (changed) |cs| {
+            alloc.free(cs.name);
+            alloc.free(cs.file_path);
+        }
+        alloc.free(changed);
+    }
+
+    if (changed.len == 0) return try callText(alloc, id, "No changed symbols detected.");
+
+    const output = try changes_mod.formatChanges(alloc, changed);
+    defer alloc.free(output);
+    return try callText(alloc, id, output);
+}
+
+fn toolClusters(alloc: Allocator, id: ?std.json.Value, args: ?std.json.Value, brain: *brain_mod.Brain) ![]u8 {
+    const threshold: f64 = blk: {
+        if (args) |a| {
+            if (a.object.get("threshold")) |v| {
+                switch (v) {
+                    .float => |f| break :blk f,
+                    .integer => |i| break :blk @as(f64, @floatFromInt(i)),
+                    else => {},
+                }
+            }
+        }
+        break :blk 0.15;
+    };
+
+    const min_size: usize = blk: {
+        if (args) |a| {
+            if (jInt(a, "min_size")) |s| {
+                if (s > 0) break :blk @intCast(s);
+            }
+        }
+        break :blk 2;
+    };
+
+    brain.mutex.lock();
+    defer brain.mutex.unlock();
+
+    const result = cluster_mod.clusterUnits(alloc, brain.entries.items, threshold, min_size) catch
+        return try callError(alloc, id, "Clustering failed");
+    defer cluster_mod.freeResult(alloc, result);
+
+    const output = try cluster_mod.formatClusters(alloc, result);
     defer alloc.free(output);
     return try callText(alloc, id, output);
 }
